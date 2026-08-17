@@ -43,6 +43,9 @@ pip freeze > requirements.txt
 .venv/                   # 全アプリ共有（Git 管理外）
 requirements.txt         # 全アプリ共有の依存
 .vscode/
+tools/
+  build.py               # アプリを実行ファイルにまとめる（成果物は build/ 配下）
+build/                   # ビルド生成物（Git 管理外）
 common/                  # 複数アプリで使う共通コード（必要になってから作る）
 apps/
   webcam/                # アプリ 1 つにつき 1 フォルダ
@@ -80,6 +83,7 @@ apps/
 
 - **カレントディレクトリに依存しない。** 実行時の cwd はリポジトリ直下になるため、設定ファイルやアセットは `Path(__file__).parent / "config.json"` のように `__file__` 起点で解決する。
 - アプリが読み書きするデータファイルは、そのアプリのフォルダ配下に置く。
+- ただし実行ファイル化する予定のアプリは `__file__` 起点だと破綻する。「ビルド（実行ファイル化）」を参照。
 
 ## Tkinter 実装ルール
 
@@ -113,6 +117,23 @@ apps/
 5. `python apps/<アプリ名>/main.py` で起動確認する。
 
 既存アプリには手を入れない。共通化が必要になった時点で `common/` に切り出す。
+
+## ビルド（実行ファイル化）
+
+```powershell
+python tools/build.py webpin              # 1 ファイルの exe（コンソールあり）
+python tools/build.py webpin --windowed   # コンソールを出さない配布用
+python tools/build.py webcam --onedir     # OpenCV を使うアプリはこちら
+```
+
+- 実行ファイルを作るときは **必ず `tools/build.py` を通す**。PyInstaller を直接叩かない。
+- 生成物はすべて `build/` 配下に出す（`build/dist/` 成果物、`build/work/` 中間ファイル、`build/spec/` spec）。リポジトリ直下を汚さない。
+- `build/` は Git 管理対象外（`.gitignore` に記載）。成果物はコミットしない。
+- PyInstaller はビルド時にしか使わないため `requirements.txt` に含めない。未導入なら `pip install pyinstaller`。
+- アプリ内相対 import を解決するため `--paths apps/<アプリ名>` が必要。`tools/build.py` が自動で渡す。
+- OpenCV を使うアプリ（`webcam` / `esp32cam`）は `--onefile` だと起動のたびに展開が走って数秒かかる。`--onedir` を使う。
+- `--windowed` はエラー出力が一切見えなくなるため、動作確認が済んでから付ける。
+- **`Path(__file__)` 起点のデータパスは exe 化すると壊れる。** `--onefile` は一時フォルダへ自己展開するので、設定やログの保存先がそこになり終了時に消える。実行ファイル化するアプリは `getattr(sys, "frozen", False)` で分岐し、`sys.executable` 起点に切り替える。
 
 ## 変更後の確認
 

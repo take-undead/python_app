@@ -9,3 +9,6 @@ apps/*/downloads/
 
 # Claude Code の許可リスト（この PC 固有の絶対パスが入るため共有しない）
 .claude/settings.json
+
+# ビルド生成物（tools/build.py の出力先）
+build/
