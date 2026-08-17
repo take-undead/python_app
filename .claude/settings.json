@@ -38,7 +38,9 @@
       "PowerShell(git ls-remote https://github.com/take-undead/python_app.git; \"exit=$LASTEXITCODE\"; git config --get user.name; git config --get user.email; git config --get init.defaultBranch)",
       "PowerShell(git init -b main)",
       "PowerShell(git remote add origin https://github.com/take-undead/python_app.git)",
-      "PowerShell(git add -A; git status --short; \"\"; \"--- file count ---\"; \\(git diff --cached --name-only | Measure-Object -Line\\).Lines)"
+      "PowerShell(git add -A; git status --short; \"\"; \"--- file count ---\"; \\(git diff --cached --name-only | Measure-Object -Line\\).Lines)",
+      "PowerShell(git push -u origin main)",
+      "PowerShell(git ls-remote origin)"
     ]
   }
 }
