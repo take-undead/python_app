@@ -3,8 +3,8 @@
 PyInstaller の生成物（成果物・作業ファイル・spec）をすべて build/ 配下に集める。
 
 実行方法（リポジトリ直下から、.venv を有効化した状態で）:
-    python tools/build.py webpin              # 1 ファイルの exe（コンソールあり）
-    python tools/build.py webpin --windowed   # コンソールを出さない配布用
+    python tools/build.py webpin              # 1 ファイルの exe（コンソールなし）
+    python tools/build.py webpin --console    # 起動しないときの原因調査用
     python tools/build.py webcam --onedir     # OpenCV を使うアプリはこちら推奨
 
 出力:
@@ -51,8 +51,65 @@ def ensure_pyinstaller() -> None:
         raise SystemExit(1)
 
 
-def build(app: str, onedir: bool = False, windowed: bool = False) -> Path:
-    """指定したアプリをビルドし、成果物のパスを返す。"""
+def artifact_path(app: str, onedir: bool = False) -> Path:
+    """ビルド成果物のパスを返す。"""
+    dist = BUILD_DIR / "dist"
+    return dist / app / f"{app}.exe" if onedir else dist / f"{app}.exe"
+
+
+def _running_pids(image_name: str) -> list[str]:
+    """指定した実行ファイル名で動いているプロセスの PID を返す。"""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+    except OSError:
+        return []
+
+    pids: list[str] = []
+    for line in result.stdout.splitlines():
+        fields = [field.strip('"') for field in line.split('","')]
+        if len(fields) >= 2 and fields[0].lower() == image_name.lower():
+            pids.append(fields[1])
+    return pids
+
+
+def ensure_not_running(app: str, onedir: bool = False) -> None:
+    """上書き先の実行ファイルがロックされていたら、原因を示して終了する。
+
+    Windows は実行中の exe を削除できないため、そのままビルドすると
+    PyInstaller が PermissionError で落ちて原因が分かりにくい。
+    """
+    target = artifact_path(app, onedir)
+    if not target.exists():
+        return
+
+    try:
+        # 実行中の exe は書き込み用に開けない
+        with target.open("r+b"):
+            return
+    except OSError:
+        pass
+
+    pids = _running_pids(target.name)
+    detail = f"（PID {', '.join(pids)}）" if pids else ""
+    print(
+        f"{target.name} が実行中です{detail}。\n"
+        f"    {target}\n"
+        "ウィンドウを閉じてから再実行してください。",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+def build(app: str, onedir: bool = False, console: bool = False) -> Path:
+    """指定したアプリをビルドし、成果物のパスを返す。
+
+    既定はコンソールなし（配布向け）。console=True にすると例外が読めるようになる。
+    """
     app_dir = APPS_DIR / app
     entry = app_dir / "main.py"
     if not entry.is_file():
@@ -60,6 +117,8 @@ def build(app: str, onedir: bool = False, windowed: bool = False) -> Path:
             f"アプリ '{app}' が見つかりません。利用できるアプリ: "
             + ", ".join(available_apps())
         )
+
+    ensure_not_running(app, onedir)
 
     command = [
         sys.executable,
@@ -81,15 +140,14 @@ def build(app: str, onedir: bool = False, windowed: bool = False) -> Path:
         str(BUILD_DIR / "spec"),
         "--onedir" if onedir else "--onefile",
     ]
-    if windowed:
-        command.append("--windowed")
+    # 既定は --windowed。バンドル漏れによる起動失敗を調べるときだけコンソールを出す
+    command.append("--console" if console else "--windowed")
     command.append(str(entry))
 
     print("実行:", " ".join(command), "\n")
     subprocess.run(command, cwd=ROOT, check=True)
 
-    dist = BUILD_DIR / "dist"
-    return dist / app if onedir else dist / f"{app}.exe"
+    return artifact_path(app, onedir)
 
 
 def main() -> None:
@@ -103,9 +161,9 @@ def main() -> None:
         help="1 ファイルではなくフォルダ形式で出力する（起動が速い）",
     )
     parser.add_argument(
-        "--windowed",
+        "--console",
         action="store_true",
-        help="コンソールウィンドウを出さない（動作確認が済んでから使う）",
+        help="コンソールを出す（exe が起動しない原因を調べるとき）",
     )
     args = parser.parse_args()
 
@@ -117,7 +175,7 @@ def main() -> None:
             " --onedir を検討してください。\n"
         )
 
-    artifact = build(args.app, onedir=args.onedir, windowed=args.windowed)
+    artifact = build(args.app, onedir=args.onedir, console=args.console)
 
     print(f"\n[完了] {artifact}")
     print(

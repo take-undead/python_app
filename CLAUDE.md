@@ -121,8 +121,8 @@ apps/
 ## ビルド（実行ファイル化）
 
 ```powershell
-python tools/build.py webpin              # 1 ファイルの exe（コンソールあり）
-python tools/build.py webpin --windowed   # コンソールを出さない配布用
+python tools/build.py webpin              # 1 ファイルの exe（コンソールなし）
+python tools/build.py webpin --console    # 起動しないときの原因調査用
 python tools/build.py webcam --onedir     # OpenCV を使うアプリはこちら
 ```
 
@@ -132,7 +132,9 @@ python tools/build.py webcam --onedir     # OpenCV を使うアプリはこち�
 - PyInstaller はビルド時にしか使わないため `requirements.txt` に含めない。未導入なら `pip install pyinstaller`。
 - アプリ内相対 import を解決するため `--paths apps/<アプリ名>` が必要。`tools/build.py` が自動で渡す。
 - OpenCV を使うアプリ（`webcam` / `esp32cam`）は `--onefile` だと起動のたびに展開が走って数秒かかる。`--onedir` を使う。
-- `--windowed` はエラー出力が一切見えなくなるため、動作確認が済んでから付ける。
+- アプリの動作確認はビルド前に `python apps/<アプリ名>/main.py` で済ませる。exe を作る意味があるのは配布形態の検証だけ。
+- 既定はコンソールなし。**exe が起動しない場合のみ `--console` で作り直す。** モジュールの同梱漏れやパス崩れは Python 実行では再現せず exe 起動時にしか出ないため、そのときだけ例外を読む必要がある。
+- ビルド先の exe が実行中だと Windows が上書きを拒否する。`tools/build.py` が検出して PID を表示するので、ウィンドウを閉じてから再実行する。`--onefile` の exe は親子 2 プロセス構成のため、強制終了ではなくウィンドウの「×」で閉じること（親だけ落とすと子が残ってロックし続ける）。
 - **`Path(__file__)` 起点のデータパスは exe 化すると壊れる。** `--onefile` は一時フォルダへ自己展開するので、設定やログの保存先がそこになり終了時に消える。実行ファイル化するアプリは `getattr(sys, "frozen", False)` で分岐し、`sys.executable` 起点に切り替える。
 
 ## 変更後の確認
