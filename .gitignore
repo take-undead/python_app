@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# 各アプリが実行時に生成するファイル
+apps/*/captures/
+apps/*/logs/
+apps/*/downloads/

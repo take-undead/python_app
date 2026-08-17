@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "webcam",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/apps/webcam/main.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "webpin",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/apps/webpin/main.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "esp32cam",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/apps/esp32cam/main.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "現在のファイル",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
