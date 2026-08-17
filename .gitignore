@@ -6,3 +6,6 @@ __pycache__/
 apps/*/captures/
 apps/*/logs/
 apps/*/downloads/
+
+# Claude Code の許可リスト（この PC 固有の絶対パスが入るため共有しない）
+.claude/settings.json
