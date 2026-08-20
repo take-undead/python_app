@@ -9,12 +9,12 @@ from __future__ import annotations
 import queue
 import threading
 import tkinter as tk
-from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
 from logic import api, settings
 from logic.api import ApiError
+from logic.paths import data_dir
 from logic.stream import StreamError
 from ui.camera_tile import CameraTile
 from ui.photo_preview import PhotoPreview
@@ -26,7 +26,7 @@ _INTERVAL_MS = 40
 _COLUMNS = 3
 
 # PC に写真を保存するときの既定フォルダ
-DOWNLOAD_DIR = Path(__file__).resolve().parent.parent / "downloads"
+DOWNLOAD_DIR = data_dir() / "downloads"
 
 
 class MainWindow(ttk.Frame):

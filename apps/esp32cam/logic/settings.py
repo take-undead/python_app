@@ -1,15 +1,16 @@
 """カメラ 6 台分の IP アドレスを保存・復元する。
 
-保存先はアプリフォルダ配下の settings.json（カレントディレクトリに依存させない）。
+保存先は settings.json（カレントディレクトリに依存させない。場所は logic/paths.py）。
 このモジュールは Tkinter に依存しない。
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
-SETTINGS_PATH = Path(__file__).resolve().parent.parent / "settings.json"
+from logic.paths import data_dir
+
+SETTINGS_PATH = data_dir() / "settings.json"
 
 # 同時に表示するカメラの台数
 CAMERA_COUNT = 6

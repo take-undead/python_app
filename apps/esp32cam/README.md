@@ -40,6 +40,21 @@ PC に保存した写真の既定の保存先は `downloads/` フォルダ。
 映像の受信中に切れたカメラは、6 台分のダイアログが積み重なるのを避けるため、
 そのタイルとステータスバーにだけエラーを表示する。
 
+## 実行ファイル化
+
+```powershell
+python tools/build.py esp32cam            # 1 ファイルの exe（build/dist/esp32cam.exe）
+python tools/build.py esp32cam --onedir   # 起動を速くしたい場合
+```
+
+`--onefile` は OpenCV を含むため約 67MB になり、起動のたびに展開が走って
+2〜3 秒かかる。配布より起動の速さを優先するなら `--onedir` を使う。
+
+exe 版の `settings.json` と `downloads/` は **exe と同じフォルダ** に作られる
+（`logic/paths.py` の `data_dir()` が frozen かどうかで切り替える）。
+`__file__` 起点のままだと `--onefile` の一時展開フォルダに保存され、
+終了時に消えてしまう。
+
 ## 通信するファームウェアのエンドポイント
 
 | 用途 | エンドポイント |
@@ -64,6 +79,7 @@ ui/imaging.py          画像の変換・拡大縮小
 logic/api.py           HTTP API クライアント（ポート 80）
 logic/stream.py        MJPEG 受信（ポート 81）
 logic/settings.py      6 台分の IP アドレスの保存・復元
+logic/paths.py         データの保存先（通常実行と exe で切り替える）
 ```
 
 台数は `logic/settings.py` の `CAMERA_COUNT`、列数は `ui/main_window.py` の
