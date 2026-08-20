@@ -15,9 +15,18 @@ import websocket
 
 from logic.protocol import ProtocolError, Sample, parse_message
 
-# config.h の STATIC_IP / HOSTNAME に対応する既定の接続先
-DEFAULT_URL = "ws://192.168.1.136/ws"
-MDNS_URL = "ws://t-iot_mobile.local/ws"
+# config.h の STATIC_IP / HOSTNAME に対応する既定の接続先。
+# 同じマイコンでも、つなぐネットワークによって 192.168.1.x と 192.168.2.x がある。
+# ローカルネットワーク前提なので `192.168.` は省いた形で持つ
+DEFAULT_HOST = "1.132"
+ALT_HOST = "2.132"
+MDNS_HOST = "t-iot_mobile.local"
+
+# 接続先の入力候補。先頭を既定値として表示する
+CANDIDATE_HOSTS = (DEFAULT_HOST, ALT_HOST, MDNS_HOST)
+
+# `1.132` のような省略入力に補うプレフィックス
+LOCAL_PREFIX = "192.168."
 
 # 接続のタイムアウト（秒）
 _CONNECT_TIMEOUT_S = 5.0
@@ -36,14 +45,27 @@ class WsError(Exception):
     """接続・受信を続けられないときに送出する。"""
 
 
+def _is_short_local_ip(host: str) -> bool:
+    """`1.132` のような、192.168. を省いた 2 オクテット表記かどうか。"""
+    parts = host.split(".")
+    if len(parts) != 2:
+        return False
+    return all(part.isdigit() and 0 <= int(part) <= 255 for part in parts)
+
+
 def normalize_url(text: str) -> str:
     """入力された接続先を ws:// 形式の URL に整える。
 
-    `192.168.1.136` や `t-iot_mobile.local` のようなホスト名だけの入力も受け付ける。
+    `192.168.1.132` や `t-iot_mobile.local` のようなホスト名だけの入力も受け付ける。
+    ローカルネットワーク前提なので、`1.132` のように 192.168. を省いてもよい。
     """
     url = text.strip()
     if not url:
         raise WsError("接続先を入力してください。")
+    if not url.startswith(("ws://", "wss://", "http://", "https://")) and (
+        _is_short_local_ip(url.split("/")[0].split(":")[0])
+    ):
+        url = LOCAL_PREFIX + url
     if url.startswith("http://"):
         url = "ws://" + url[len("http://") :]
     elif url.startswith("https://"):

@@ -9,7 +9,13 @@ from tkinter import filedialog, messagebox, ttk
 from logic.protocol import default_visible_pins
 from logic.recorder import CsvRecorder, RecorderError, default_log_path
 from logic.series import DEFAULT_CAPACITY, SeriesStore
-from logic.ws_client import DEFAULT_URL, PinClient, WsError, normalize_url
+from logic.ws_client import (
+    CANDIDATE_HOSTS,
+    DEFAULT_HOST,
+    PinClient,
+    WsError,
+    normalize_url,
+)
 from ui.chart import ChartFrame, color_for
 
 # 受信キューを取り出す間隔（ミリ秒）。マイコン側は約 200ms 間隔で送ってくる
@@ -47,7 +53,7 @@ class MainWindow(ttk.Frame):
         self._pin_vars: dict[str, tk.BooleanVar] = {}
         self._pin_value_vars: dict[str, tk.StringVar] = {}
 
-        self._url_var = tk.StringVar(value=DEFAULT_URL)
+        self._url_var = tk.StringVar(value=DEFAULT_HOST)
         self._window_var = tk.StringVar(value=_WINDOW_CHOICES[1][0])
         self._status_var = tk.StringVar(value="接続先を確認して「接続」を押してください。")
         self._count_var = tk.StringVar(value="受信 0 件")
@@ -94,7 +100,7 @@ class MainWindow(ttk.Frame):
         self._url_entry = ttk.Combobox(
             control,
             textvariable=self._url_var,
-            values=[DEFAULT_URL, "ws://t-iot_mobile.local/ws"],
+            values=list(CANDIDATE_HOSTS),
             width=32,
         )
         self._url_entry.grid(row=0, column=1, padx=(0, 8))
