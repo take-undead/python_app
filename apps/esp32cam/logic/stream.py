@@ -45,6 +45,7 @@ class MjpegStream:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._frame: np.ndarray | None = None
+        self._frame_new = False
         self._error: str | None = None
         self._response = None
 
@@ -96,10 +97,22 @@ class MjpegStream:
 
         with self._lock:
             self._frame = None
+            self._frame_new = False
 
     def latest_frame(self) -> np.ndarray | None:
         """最新フレーム（BGR）を返す。まだ 1 枚も受信できていなければ None。"""
         with self._lock:
+            return self._frame
+
+    def take_frame(self) -> np.ndarray | None:
+        """前回の取り出し以降に届いたフレームを返す。届いていなければ None。
+
+        複数台を同時に描画するとき、変化が無いカメラの画像変換を省くために使う。
+        """
+        with self._lock:
+            if not self._frame_new:
+                return None
+            self._frame_new = False
             return self._frame
 
     def take_error(self) -> str | None:
@@ -157,6 +170,7 @@ class MjpegStream:
                 continue  # 壊れたフレームは捨てて次を待つ
             with self._lock:
                 self._frame = frame
+                self._frame_new = True
 
     def _set_error(self, message: str) -> None:
         with self._lock:

@@ -14,9 +14,9 @@ from ui.main_window import MainWindow
 
 def main() -> None:
     root = tk.Tk()
-    root.title("ESP32-CAM ビューア")
-    root.geometry("1024x680")
-    root.minsize(720, 480)
+    root.title("ESP32-CAM ビューア（6 台同時表示）")
+    root.geometry("1360x820")
+    root.minsize(1000, 620)
 
     # 日本語が崩れないよう、Windows 標準の日本語フォントを明示する
     style = ttk.Style(root)
