@@ -6,15 +6,18 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from logic.protocol import default_visible_pins
+from logic.paths import data_dir
+from logic.protocol import CHART_COUNT, CHART_HIDDEN, default_chart_assignment
 from logic.recorder import CsvRecorder, RecorderError, default_log_path
 from logic.series import DEFAULT_CAPACITY, SeriesStore
 from logic.ws_client import (
-    CANDIDATE_HOSTS,
-    DEFAULT_HOST,
+    DEFAULT_OCTETS,
+    LOCAL_PREFIX,
+    OCTET_MAX,
+    OCTET_MIN,
     PinClient,
     WsError,
-    normalize_url,
+    url_from_octets,
 )
 from ui.chart import ChartFrame, color_for
 
@@ -33,8 +36,20 @@ _WINDOW_CHOICES: tuple[tuple[str, float | None], ...] = (
     ("全期間", None),
 )
 
-# CSV の既定の保存先（カレントディレクトリに依存させない）
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+# CSV の既定の保存先（カレントディレクトリに依存させない）。
+# 実行ファイルのときは exe と同じフォルダの logs/ になる
+LOG_DIR = data_dir() / "logs"
+
+# ピン一覧で選ぶグラフ番号の表示。並び順がそのままグラフ番号（0 は非表示）
+_CHART_LABELS: tuple[str, ...] = ("―", *(str(index) for index in range(1, CHART_COUNT + 1)))
+
+# 出力（DOUT）のボタンを並べる列数
+_DOUT_COLUMNS = 2
+
+
+def _dout_label(name: str, state: bool) -> str:
+    """出力ボタンの文字。いまの状態が一目で分かるようにする。"""
+    return f"{name}: {'ON' if state else 'OFF'}"
 
 
 class MainWindow(ttk.Frame):
@@ -49,11 +64,20 @@ class MainWindow(ttk.Frame):
         self._poll_id: str | None = None
         self._redraw_id: str | None = None
 
-        # ピンごとの表示チェックと最新値ラベル。ピンは受信して初めて分かる
-        self._pin_vars: dict[str, tk.BooleanVar] = {}
+        # ピンごとの「どのグラフに出すか」と最新値ラベル。ピンは受信して初めて分かる
+        self._pin_chart_vars: dict[str, tk.StringVar] = {}
         self._pin_value_vars: dict[str, tk.StringVar] = {}
 
-        self._url_var = tk.StringVar(value=DEFAULT_HOST)
+        # ON/OFF を指示できる DOUT。系列名 -> GPIO 番号 / 状態 / ボタンの文字 / ボタン
+        self._dout_pins: dict[str, int] = {}
+        self._dout_vars: dict[str, tk.BooleanVar] = {}
+        self._dout_label_vars: dict[str, tk.StringVar] = {}
+        self._dout_buttons: dict[str, ttk.Checkbutton] = {}
+
+        # 接続先は 192.168.<第 3>.<第 4> の 2 つだけ入力させる
+        self._octet3_var = tk.StringVar(value=str(DEFAULT_OCTETS[0]))
+        self._octet4_var = tk.StringVar(value=str(DEFAULT_OCTETS[1]))
+        self._url_var = tk.StringVar(value="")  # 接続時に組み立てた URL を保持する
         self._window_var = tk.StringVar(value=_WINDOW_CHOICES[1][0])
         self._status_var = tk.StringVar(value="接続先を確認して「接続」を押してください。")
         self._count_var = tk.StringVar(value="受信 0 件")
@@ -73,13 +97,24 @@ class MainWindow(ttk.Frame):
         body = ttk.Frame(self)
         body.grid(row=1, column=0, sticky="nsew", pady=8)
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
 
-        self._chart = ChartFrame(body, self._store)
-        self._chart.grid(row=0, column=0, sticky="nsew")
-        self._chart.set_window_seconds(_WINDOW_CHOICES[1][1])
+        # グラフを縦に並べる。桁の違う系列を別の軸で見られるようにするため
+        self._charts: list[ChartFrame] = []
+        for index in range(CHART_COUNT):
+            chart = ChartFrame(body, self._store, title=f"グラフ {index + 1}")
+            chart.grid(row=index, column=0, sticky="nsew", pady=(0 if index == 0 else 6, 0))
+            chart.set_window_seconds(_WINDOW_CHOICES[1][1])
+            body.rowconfigure(index, weight=1)
+            self._charts.append(chart)
 
-        self._build_pin_panel(body)
+        # 右側は上が出力（操作）、下がピン一覧（ロギングと表示）。役割が違うので分ける
+        side = ttk.Frame(body)
+        side.grid(row=0, column=1, rowspan=CHART_COUNT, sticky="ns", padx=(8, 0))
+        side.rowconfigure(1, weight=1)
+
+        self._build_dout_panel(side)
+        self._build_pin_panel(side)
+        self._apply_assignments()
 
         status = ttk.Frame(self)
         status.grid(row=2, column=0, sticky="ew")
@@ -97,13 +132,29 @@ class MainWindow(ttk.Frame):
 
         ttk.Label(control, text="接続先:").grid(row=0, column=0, padx=(0, 4))
 
-        self._url_entry = ttk.Combobox(
-            control,
-            textvariable=self._url_var,
-            values=list(CANDIDATE_HOSTS),
-            width=32,
+        # ローカルネットワーク前提。192.168. は固定で、残り 2 つだけ入力させる
+        address = ttk.Frame(control)
+        address.grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(address, text=LOCAL_PREFIX).grid(row=0, column=0)
+        self._octet3_entry = ttk.Spinbox(
+            address,
+            textvariable=self._octet3_var,
+            from_=OCTET_MIN,
+            to=OCTET_MAX,
+            width=4,
+            justify="right",
         )
-        self._url_entry.grid(row=0, column=1, padx=(0, 8))
+        self._octet3_entry.grid(row=0, column=1)
+        ttk.Label(address, text=".").grid(row=0, column=2, padx=1)
+        self._octet4_entry = ttk.Spinbox(
+            address,
+            textvariable=self._octet4_var,
+            from_=OCTET_MIN,
+            to=OCTET_MAX,
+            width=4,
+            justify="right",
+        )
+        self._octet4_entry.grid(row=0, column=3)
 
         self._connect_button = ttk.Button(
             control, text="接続", command=self._on_connect, width=8
@@ -142,14 +193,56 @@ class MainWindow(ttk.Frame):
             row=0, column=8, sticky="e"
         )
 
+    def _build_dout_panel(self, master: tk.Misc) -> None:
+        """DOUT を ON/OFF するボタンを並べる枠。
+
+        こちらから操作する機能で、記録・表示（ピン一覧）とは役割が違うため分けている。
+        ボタンはマイコンから DOUT が届いた時点で作る。
+        """
+        self._dout_panel = ttk.LabelFrame(master, text="出力（DOUT）", padding=6)
+        self._dout_panel.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for column in range(_DOUT_COLUMNS):
+            self._dout_panel.columnconfigure(column, weight=1)
+
+        self._dout_placeholder = ttk.Label(
+            self._dout_panel, text="未受信", foreground="#808080"
+        )
+        self._dout_placeholder.grid(row=0, column=0, columnspan=_DOUT_COLUMNS, sticky="w")
+
+    def _add_dout_buttons(self, names: list[str]) -> None:
+        """新しく現れた DOUT の ON/OFF ボタンを追加する。"""
+        self._dout_placeholder.grid_remove()
+
+        for name in names:
+            position = len(self._dout_buttons)
+            row, column = divmod(position, _DOUT_COLUMNS)
+
+            state_var = tk.BooleanVar(value=bool(self._store.latest(name)))
+            label_var = tk.StringVar(value=_dout_label(name, state_var.get()))
+            self._dout_vars[name] = state_var
+            self._dout_label_vars[name] = label_var
+
+            # Toolbutton にすると、押し込み表示のボタンとして扱える
+            button = ttk.Checkbutton(
+                self._dout_panel,
+                style="Toolbutton",
+                textvariable=label_var,
+                variable=state_var,
+                width=12,
+                command=lambda pin=name: self._on_dout_toggled(pin),
+                state="normal" if self._client is not None else "disabled",
+            )
+            button.grid(row=row, column=column, padx=2, pady=2, sticky="ew")
+            self._dout_buttons[name] = button
+
     def _build_pin_panel(self, master: tk.Misc) -> None:
-        """右側のピン一覧。受信した系列を表示切り替えと最新値付きで並べる。"""
-        panel = ttk.LabelFrame(master, text="ピン", padding=6)
-        panel.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+        """右側のピン一覧。系列ごとに、出すグラフの番号と最新値を並べる。"""
+        panel = ttk.LabelFrame(master, text="ピン（出力先のグラフ）", padding=6)
+        panel.grid(row=1, column=0, sticky="ns")
         panel.rowconfigure(0, weight=1)
 
         # 系列が増えても収まるようにスクロールできるようにする
-        canvas = tk.Canvas(panel, width=250, highlightthickness=0, borderwidth=0)
+        canvas = tk.Canvas(panel, width=340, highlightthickness=0, borderwidth=0)
         canvas.grid(row=0, column=0, sticky="ns")
         scrollbar = ttk.Scrollbar(panel, orient="vertical", command=canvas.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -170,7 +263,7 @@ class MainWindow(ttk.Frame):
         self._pin_placeholder = ttk.Label(
             self._pin_container, text="未受信", foreground="#808080"
         )
-        self._pin_placeholder.grid(row=0, column=0, columnspan=3, sticky="w")
+        self._pin_placeholder.grid(row=0, column=0, columnspan=5, sticky="w")
 
     # ------------------------------------------------------------------
     # 操作
@@ -180,7 +273,7 @@ class MainWindow(ttk.Frame):
             return
 
         try:
-            url = normalize_url(self._url_var.get())
+            url = url_from_octets(self._octet3_var.get(), self._octet4_var.get())
         except WsError as exc:
             messagebox.showerror("接続エラー", str(exc), parent=self)
             return
@@ -191,8 +284,10 @@ class MainWindow(ttk.Frame):
         self._client = client
 
         self._connect_button.configure(state="disabled")
-        self._url_entry.configure(state="disabled")
+        self._octet3_entry.configure(state="disabled")
+        self._octet4_entry.configure(state="disabled")
         self._disconnect_button.configure(state="normal")
+        self._update_dout_buttons()
         self._status_var.set(f"{url} に接続しています...")
 
         self._schedule_poll()
@@ -262,21 +357,86 @@ class MainWindow(ttk.Frame):
         for var in self._pin_value_vars.values():
             var.set("-")
         self._count_var.set("受信 0 件")
-        self._chart.redraw()
+        self._redraw_charts()
 
     def _on_window_changed(self, _event: tk.Event) -> None:
         label = self._window_var.get()
         for name, seconds in _WINDOW_CHOICES:
             if name == label:
-                self._chart.set_window_seconds(seconds)
+                for chart in self._charts:
+                    chart.set_window_seconds(seconds)
                 break
-        self._chart.redraw()
+        self._redraw_charts()
 
-    def _on_pin_toggled(self) -> None:
-        self._chart.set_visible_pins(
-            {pin for pin, var in self._pin_vars.items() if var.get()}
-        )
-        self._chart.redraw()
+    def _on_chart_changed(self, _event: tk.Event) -> None:
+        self._apply_assignments()
+
+    # ------------------------------------------------------------------
+    # DOUT の ON/OFF
+    # ------------------------------------------------------------------
+    def _on_dout_toggled(self, name: str) -> None:
+        """ピン一覧の「出力」を押したとき、マイコンに ON/OFF を指示する。"""
+        var = self._dout_vars[name]
+        client = self._client
+        gpio = self._dout_pins.get(name)
+
+        if client is None or gpio is None:
+            messagebox.showerror(
+                "送信エラー", "接続していないため指示できません。", parent=self
+            )
+            self._sync_dout_states()
+            return
+
+        state = var.get()
+        try:
+            client.set_dout(gpio, state)
+        except WsError as exc:
+            messagebox.showerror("送信エラー", str(exc), parent=self)
+            self._sync_dout_states()
+            return
+
+        # 実際の状態はマイコンからの次の state で確定する
+        self._dout_label_vars[name].set(_dout_label(name, state))
+        self._status_var.set(f"{name}（GP{gpio}）を {'ON' if state else 'OFF'} にしました。")
+
+    def _sync_dout_states(self) -> None:
+        """ボタンの見た目を、マイコンが返している状態に合わせる。"""
+        for name, var in self._dout_vars.items():
+            value = self._store.latest(name)
+            if value is not None:
+                var.set(value >= 0.5)
+            self._dout_label_vars[name].set(_dout_label(name, var.get()))
+
+    def _update_dout_buttons(self) -> None:
+        """接続していないときは ON/OFF を押せないようにする。"""
+        state = "normal" if self._client is not None else "disabled"
+        for button in self._dout_buttons.values():
+            button.configure(state=state)
+
+    def _apply_assignments(self) -> None:
+        """ピン一覧で選ばれた番号どおりに、各グラフの系列を入れ替える。"""
+        assignment = {
+            pin: _CHART_LABELS.index(var.get())
+            for pin, var in self._pin_chart_vars.items()
+        }
+        used = set(assignment.values()) - {CHART_HIDDEN}
+
+        for number, chart in enumerate(self._charts, start=1):
+            chart.set_visible_pins(
+                {pin for pin, target in assignment.items() if target == number}
+            )
+            # 何も割り当てられていないグラフは畳んで、残りに高さを譲る。
+            # ただしどこにも割り当てが無いときは、1 つ目だけ枠を残す
+            if number in used or (number == 1 and not used):
+                chart.grid()
+            else:
+                chart.grid_remove()
+
+        self._redraw_charts()
+
+    def _redraw_charts(self) -> None:
+        for chart in self._charts:
+            chart.redraw()
 
     # ------------------------------------------------------------------
     # 受信の取り込み
@@ -297,15 +457,26 @@ class MainWindow(ttk.Frame):
 
         samples = client.poll()
         if samples:
-            known_pins = set(self._pin_vars)
+            known_pins = set(self._pin_chart_vars)
             for sample in samples:
                 self._store.add(sample)
+                # ON/OFF の指示には GPIO 番号が要る。ボタンを作る前に控える
+                self._dout_pins.update(sample.outputs)
 
             new_pins = [
                 pin for pin in self._store.pins() if pin not in known_pins
             ]
             if new_pins:
                 self._add_pin_rows(new_pins)
+
+            new_douts = [
+                name for name in self._dout_pins if name not in self._dout_buttons
+            ]
+            if new_douts:
+                self._add_dout_buttons(new_douts)
+
+            # 実際の出力状態はマイコンが返す値が正。ボタンはそれに追従させる
+            self._sync_dout_states()
 
             recorder = self._recorder
             if recorder is not None:
@@ -336,15 +507,17 @@ class MainWindow(ttk.Frame):
         self._pin_placeholder.grid_remove()
 
         all_pins = self._store.pins()
-        visible = default_visible_pins(all_pins)
+        defaults = default_chart_assignment(all_pins)
 
         for pin in pins:
-            row = len(self._pin_vars)
+            row = len(self._pin_chart_vars)
             index = all_pins.index(pin)
 
-            checked = tk.BooleanVar(value=pin in visible)
+            chart_var = tk.StringVar(
+                value=_CHART_LABELS[defaults.get(pin, CHART_HIDDEN)]
+            )
             value_var = tk.StringVar(value="-")
-            self._pin_vars[pin] = checked
+            self._pin_chart_vars[pin] = chart_var
             self._pin_value_vars[pin] = value_var
 
             # 線の色をそのまま凡例にする
@@ -357,18 +530,23 @@ class MainWindow(ttk.Frame):
             swatch.grid(row=row, column=0, padx=(0, 4), pady=1)
             swatch.grid_propagate(False)
 
-            ttk.Checkbutton(
+            ttk.Label(self._pin_container, text=pin).grid(row=row, column=1, sticky="w")
+
+            chart_combo = ttk.Combobox(
                 self._pin_container,
-                text=pin,
-                variable=checked,
-                command=self._on_pin_toggled,
-            ).grid(row=row, column=1, sticky="w")
+                textvariable=chart_var,
+                values=list(_CHART_LABELS),
+                state="readonly",
+                width=3,
+            )
+            chart_combo.grid(row=row, column=2, padx=(4, 0))
+            chart_combo.bind("<<ComboboxSelected>>", self._on_chart_changed)
 
             ttk.Label(
                 self._pin_container, textvariable=value_var, anchor="e", width=8
-            ).grid(row=row, column=2, sticky="e", padx=(4, 0))
+            ).grid(row=row, column=3, sticky="e", padx=(4, 0))
 
-        self._on_pin_toggled()
+        self._apply_assignments()
 
     # ------------------------------------------------------------------
     # グラフの更新
@@ -378,7 +556,7 @@ class MainWindow(ttk.Frame):
 
     def _redraw(self) -> None:
         self._redraw_id = None
-        self._chart.redraw()
+        self._redraw_charts()
         if self._client is not None:
             self._schedule_redraw()
 
@@ -398,8 +576,10 @@ class MainWindow(ttk.Frame):
             client.stop()
 
         self._connect_button.configure(state="normal")
-        self._url_entry.configure(state="normal")
+        self._octet3_entry.configure(state="normal")
+        self._octet4_entry.configure(state="normal")
         self._disconnect_button.configure(state="disabled")
+        self._update_dout_buttons()
 
     def shutdown(self) -> None:
         """ウィンドウを閉じるときに呼ぶ。接続とログを確実に閉じる。"""

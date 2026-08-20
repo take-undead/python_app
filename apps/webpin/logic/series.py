@@ -34,6 +34,11 @@ class SeriesStore:
         """受信した Sample の総数。"""
         return self._count
 
+    @property
+    def start_timestamp(self) -> float | None:
+        """経過秒 0 に対応する PC の時刻（time.time() の値）。未受信なら None。"""
+        return self._start
+
     def pins(self) -> list[str]:
         """観測したピン名を、最初に現れた順で返す。"""
         return list(self._series)

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 
@@ -15,18 +16,16 @@ import websocket
 
 from logic.protocol import ProtocolError, Sample, parse_message
 
-# config.h の STATIC_IP / HOSTNAME に対応する既定の接続先。
-# 同じマイコンでも、つなぐネットワークによって 192.168.1.x と 192.168.2.x がある。
-# ローカルネットワーク前提なので `192.168.` は省いた形で持つ
-DEFAULT_HOST = "1.132"
-ALT_HOST = "2.132"
-MDNS_HOST = "t-iot_mobile.local"
-
-# 接続先の入力候補。先頭を既定値として表示する
-CANDIDATE_HOSTS = (DEFAULT_HOST, ALT_HOST, MDNS_HOST)
-
-# `1.132` のような省略入力に補うプレフィックス
+# ローカルネットワーク前提。接続先は 192.168.<第 3>.<第 4> の 2 つだけを指定する
 LOCAL_PREFIX = "192.168."
+
+# 既定の接続先（config.h の STATIC_IP に対応）。同じマイコンでも、つなぐ
+# ネットワークによって 192.168.1.x と 192.168.2.x があるため第 3 も指定させる
+DEFAULT_OCTETS = (1, 132)
+
+# 各オクテットの範囲
+OCTET_MIN = 0
+OCTET_MAX = 255
 
 # 接続のタイムアウト（秒）
 _CONNECT_TIMEOUT_S = 5.0
@@ -50,7 +49,27 @@ def _is_short_local_ip(host: str) -> bool:
     parts = host.split(".")
     if len(parts) != 2:
         return False
-    return all(part.isdigit() and 0 <= int(part) <= 255 for part in parts)
+    return all(_is_octet(part) for part in parts)
+
+
+def _is_octet(text: str) -> bool:
+    return text.isdigit() and OCTET_MIN <= int(text) <= OCTET_MAX
+
+
+def url_from_octets(third: str, fourth: str) -> str:
+    """192.168.<第 3>.<第 4> の 2 つから接続先の URL を組み立てる。
+
+    入力欄が空だったり範囲外だったりしたら WsError。
+    """
+    for label, text in (("3 つ目", third), ("4 つ目", fourth)):
+        if not text.strip():
+            raise WsError(f"接続先の{label}の数値を入力してください。")
+        if not _is_octet(text.strip()):
+            raise WsError(
+                f"接続先の{label}の数値は {OCTET_MIN}〜{OCTET_MAX} で"
+                f"入力してください（入力: {text.strip()}）。"
+            )
+    return normalize_url(f"{third.strip()}.{fourth.strip()}")
 
 
 def normalize_url(text: str) -> str:
@@ -142,6 +161,15 @@ class PinClient:
         with self._lock:
             self._socket = None
             self._connected = False
+
+    def set_dout(self, pin: int, state: bool) -> None:
+        """DOUT の ON/OFF をマイコンに指示する。
+
+        マイコン側は {"type":"set_dout","pin":17,"state":true} を受け取り、
+        digitalWrite したうえで ack を返す（src/main.cpp 参照）。
+        実際の状態は次の state メッセージに反映されるので、UI はそれを待つ。
+        """
+        self.send(json.dumps({"type": "set_dout", "pin": int(pin), "state": bool(state)}))
 
     def send(self, message: str) -> None:
         """マイコンへコマンドを送る（set_dout / play_tone など）。"""

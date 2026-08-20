@@ -35,8 +35,11 @@ from dataclasses import dataclass, field
 # state メッセージ以外（ack など）はロギング対象にしない
 STATE_TYPE = "state"
 
-# グラフの初期表示で選んでおく系列の接尾辞。生値より電圧の方が読みやすい
-DEFAULT_VISIBLE_SUFFIXES = (".volt",)
+# 画面に並べるグラフの数。系列はこのどれか 1 つ、または非表示（0）に割り当てる
+CHART_COUNT = 3
+
+# 非表示を表すグラフ番号
+CHART_HIDDEN = 0
 
 
 class ProtocolError(Exception):
@@ -45,10 +48,15 @@ class ProtocolError(Exception):
 
 @dataclass
 class Sample:
-    """ある時刻に受信した 1 件分のピン値。"""
+    """ある時刻に受信した 1 件分のピン値。
+
+    outputs は ON/OFF を指示できる DOUT の「系列名 -> GPIO 番号」。
+    set_dout コマンドには GPIO 番号が要るため、名前と別に持っておく。
+    """
 
     timestamp: float
     values: dict[str, float] = field(default_factory=dict)
+    outputs: dict[str, int] = field(default_factory=dict)
     raw: str = ""
 
     @property
@@ -103,11 +111,33 @@ def _read_array(
     return values
 
 
+def _read_output_pins(message: dict) -> dict[str, int]:
+    """dout 配列から「系列名 -> GPIO 番号」を取り出す。
+
+    ON/OFF の指示（set_dout）は GPIO 番号で送るため、名前と対応づけて残す。
+    """
+    entries = message.get("dout")
+    if not isinstance(entries, list):
+        return {}
+
+    pins: dict[str, int] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        pin = entry.get("pin")
+        if isinstance(pin, int) and not isinstance(pin, bool):
+            pins[_entry_name(entry, "DOUT", index)] = pin
+    return pins
+
+
 def parse_message(text: str, timestamp: float | None = None) -> Sample | None:
     """受信した 1 メッセージを Sample に変換する。
 
     state 以外のメッセージ（ack など）は None を返す。
     解釈できないメッセージは ProtocolError を送出する。
+
+    マイコンは時刻を送ってこないため、時刻は受信した時点の PC の時計
+    （time.time()）を使う。グラフの横軸も CSV の時刻列もこれが元になる。
     """
     stripped = text.strip()
     if not stripped:
@@ -139,19 +169,36 @@ def parse_message(text: str, timestamp: float | None = None) -> Sample | None:
         return None
 
     stamp = time.time() if timestamp is None else timestamp
-    return Sample(timestamp=stamp, values=values, raw=stripped)
+    return Sample(
+        timestamp=stamp,
+        values=values,
+        outputs=_read_output_pins(message),
+        raw=stripped,
+    )
 
 
-def default_visible_pins(pins: list[str]) -> set[str]:
-    """初期表示で有効にする系列を選ぶ。
+def _default_chart(pin: str) -> int:
+    """系列名から、初期表示で置くグラフ番号を決める。0 は非表示。
 
-    電圧・デジタル入出力だけを既定にし、0〜4095 の生値や audio は外す
-    （桁が違う系列を同じ軸に載せると、他が潰れて読めなくなるため）。
+    桁の違う系列を同じ軸に載せると他が潰れて読めなくなるため、
+    電圧・デジタル・その他を別のグラフに分け、0〜4095 の生値は外しておく。
     """
-    visible = {
-        pin
-        for pin in pins
-        if pin.endswith(DEFAULT_VISIBLE_SUFFIXES)
-        or (pin.startswith(("DIN", "DOUT")) and "." not in pin)
-    }
-    return visible or set(pins)
+    if pin.endswith(".volt"):
+        return 1
+    if pin.startswith(("DIN", "DOUT")) and "." not in pin:
+        return 2
+    if pin.endswith(".raw"):
+        return CHART_HIDDEN
+    return 3
+
+
+def default_chart_assignment(pins: list[str]) -> dict[str, int]:
+    """初期表示での「系列名 -> グラフ番号」を作る。0 は非表示。
+
+    どの系列も当てはまらなかった場合は、何も映らないより良いので
+    すべてグラフ 1 に置く。
+    """
+    assignment = {pin: _default_chart(pin) for pin in pins}
+    if not any(assignment.values()):
+        return {pin: 1 for pin in pins}
+    return assignment
