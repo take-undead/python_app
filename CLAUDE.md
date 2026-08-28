@@ -64,7 +64,7 @@ apps/
 | `webcam` | `python apps/webcam/main.py` | Web カメラの映像表示と静止画保存 |
 | `webpin` | `python apps/webpin/main.py` | ESP32 のピン情報を WebSocket で受信し、グラフ表示と CSV ロギング |
 | `esp32cam` | `python apps/esp32cam/main.py` | ESP32-CAM 6 台の MJPEG 映像同時表示、撮影指示、SD カード内の写真閲覧（**参照実装**） |
-| `win_rpa` | `python apps/win_rpa/main.py` | Windows アプリを自動操作して CSV を出力させ、結合する（月次ルーティン向け。`--run` で無人実行） |
+| `win_rpa` | `python apps/win_rpa/main.py` | Windows アプリを自動操作して CSV を出力させ、フォルダ分けして結合する（月次ルーティン向け。`--run` で無人実行） |
 
 - アプリフォルダ名は英小文字とアンダースコアのみ（`python -m` でも扱えるようにするため）。
 - **アプリ間で直接 import しない。** `apps/memo` から `apps/viewer` を参照しない。共有したくなったコードは `common/` に切り出す。

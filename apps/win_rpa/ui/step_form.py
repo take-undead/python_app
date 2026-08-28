@@ -10,11 +10,17 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Any, Callable
 
-from logic.actions import ACTIONS, Step
+from logic.actions import ACTIONS, Step, actions_by_category
 from ui.field_editors import EditorContext, FieldEditor, make_editor
 
 # 表示名 → アクション名
 _LABEL_TO_ACTION = {spec.label: name for name, spec in ACTIONS.items()}
+
+# 種類の一覧。［＋ 手順を追加］と同じ並び（分類ごと）にしておく。
+# 入れ子にできないぶん、せめて並びを揃えて探す場所を一致させる
+_ACTION_LABELS = [
+    spec.label for _, items in actions_by_category() for _, spec in items
+]
 
 
 class StepForm(ttk.Frame):
@@ -50,7 +56,7 @@ class StepForm(ttk.Frame):
         self._action_box = ttk.Combobox(
             self,
             textvariable=self._action_var,
-            values=[spec.label for spec in ACTIONS.values()],
+            values=_ACTION_LABELS,
             state="readonly",
         )
         self._action_box.grid(row=0, column=1, sticky="ew", pady=(0, 4))

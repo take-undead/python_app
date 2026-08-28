@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import time
@@ -23,7 +24,13 @@ from pywinauto.controls.uiawrapper import UIAWrapper
 from pywinauto.uia_element_info import UIAElementInfo
 
 from logic import merger, winfind
-from logic.actions import Scenario, Step, build_variables, expand
+from logic.actions import (
+    Scenario,
+    Step,
+    build_variables,
+    expand,
+    requirement_error,
+)
 from logic.picker import ElementRef, describe as describe_element
 
 # 要素が見つかるまでの待ち・確認の刻み
@@ -33,6 +40,9 @@ _POLL_SEC = 0.4
 MATCH_AUTO_ID = "AutomationId"
 MATCH_NAME = "名前"
 MATCH_PATH = "構造上の位置"
+
+# Windows がフォルダ名に許さない文字（\ と / は階層の区切りとして通す）
+_BAD_NAME_CHARS = '<>:"|?*'
 
 
 class AutomationError(Exception):
@@ -89,11 +99,17 @@ class Runner:
         self._on_event = on_event or (lambda kind, text: None)
 
         self._work_dir = scenario.resolved_work_dir(base_dir)
-        self._variables = build_variables(self._work_dir, today)
+        self._variables = build_variables(
+            self._work_dir, today, scenario_name=scenario.name
+        )
         self._log_dir = base_dir / "logs" / datetime.now().strftime("%Y-%m")
 
         self._app: Application | None = None
         self._cancelled = False
+        # 「フォルダを作る」で最後に作ったフォルダ。
+        # 「CSV をまとめる」がここを読む。保存先（_work_dir）とは別に持つのは、
+        # 「以降の保存先にする」を外していても、まとめる先は作った場所だから
+        self._created_folder: Path | None = None
 
     # ------------------------------------------------------------------
     # 実行
@@ -113,6 +129,19 @@ class Runner:
         steps = self._scenario.steps[: upto if upto is not None else None]
         mode = "確認実行" if self._dry_run else "実行"
         self._emit("info", f"{mode}を開始します（{len(steps)} 手順）")
+
+        # 前提の欠けは対象アプリを起動する前に出す。
+        # 8 手順進んでから「先にフォルダを作る手順が要る」と言われても遅い
+        for index, step in enumerate(steps):
+            problem = requirement_error(step.spec, steps[:index])
+            if not problem:
+                continue
+            message = f"{problem}（手順 {index + 1}: {step.spec.label}）"
+            self._emit("error", message)
+            report.results.append(
+                StepResult(index + 1, step, False, message, 0.0)
+            )
+            return report
 
         for index, step in enumerate(steps, start=1):
             if self._cancelled:
@@ -160,6 +189,9 @@ class Runner:
             "assert_text": self._do_assert_text,
             "assert_file": self._do_assert_file,
             "merge_csv": self._do_merge_csv,
+            "make_folder": self._do_make_folder,
+            "set_work_dir": self._do_set_work_dir,
+            "copy_files": self._do_copy_files,
             "close_app": self._do_close_app,
             "run_python": self._do_run_python,
         }
@@ -435,24 +467,45 @@ class Runner:
         return f"{path.name}（{rows} 行）を確認しました"
 
     def _do_merge_csv(self, step: Step) -> str:
-        pattern = expand(str(step.params.get("pattern", "")), self._variables)
-        output = self._resolve_path(str(step.params.get("output", "")))
+        """作ったフォルダの CSV を全部まとめ、日付順に並べて同じ場所に置く。
+
+        対象を選ばせず「そのフォルダの CSV 全部」に決め打ちにしてある。
+        まとめる先が「フォルダを作る」で作った場所なので、そこに入っている
+        ものが対象、という以外の解釈が無いため。
+        """
+        folder = self._created_folder
+        if folder is None:
+            raise AutomationError(
+                "まとめる先のフォルダが決まっていません。"
+                "先に「フォルダを作る」の手順を入れてください。"
+            )
+
+        name = expand(str(step.params.get("output", "")), self._variables).strip()
+        name = Path(name.replace("\\", "/")).name
+        if not name:
+            raise AutomationError("できあがるファイル名が指定されていません。")
+        if not name.lower().endswith(".csv"):
+            name += ".csv"
+
+        output = folder / name
         add_source = bool(step.params.get("add_source", True))
         min_rows = int(step.params.get("min_rows", 2) or 0)
 
         try:
-            sources = merger.find_sources(self._work_dir, pattern)
+            # 前回の出力を取り込んで行が倍になるのを避けるため output は除く
+            sources = merger.find_sources(folder, exclude=output)
         except merger.MergeError as exc:
             if self._dry_run:
                 return f"（確認実行のため対象なし: {exc}）"
             raise AutomationError(str(exc)) from exc
 
         if self._dry_run:
-            return f"{len(sources)} 件をまとめる予定です"
+            return f"{folder} の {len(sources)} 件を {name} にまとめる予定です"
 
         try:
             result = merger.merge(
-                sources, output, add_source=add_source, min_rows=min_rows
+                sources, output, add_source=add_source, min_rows=min_rows,
+                sort_by_date=True,
             )
         except merger.MergeError as exc:
             raise AutomationError(str(exc)) from exc
@@ -463,11 +516,220 @@ class Runner:
                 "  ファイルごとに列が違います。後から足した列: "
                 + "、".join(result.added_columns),
             )
+
+        if result.sort_column:
+            self._emit("info", f"  「{result.sort_column}」の古い順に並べ替えました")
+
+            # 1 か月ぶんが揃っているかを、実行ログだけで確かめられるようにする
+            if result.first_time is not None and result.last_time is not None:
+                self._emit(
+                    "info",
+                    f"  {self._stamp(result.first_time)} 〜 "
+                    f"{self._stamp(result.last_time)} の {result.row_count} 行",
+                )
+            if result.unsorted_rows:
+                self._emit(
+                    "warn",
+                    f"  {result.unsorted_rows} 行は日時として読めなかったので"
+                    "末尾に置きました。",
+                )
+        else:
+            self._emit(
+                "warn",
+                "  先頭付近に日時の列が見つからなかったので、"
+                "読み込んだ順のままにしました。",
+            )
+
         return (
             f"{result.source_count} 件を {result.row_count} 行にまとめました"
-            f"（{result.output.name}）"
+            f"（{output}）"
         )
 
+    # ------------------------------------------------------------------
+    # ファイル操作
+    # ------------------------------------------------------------------
+    def _do_make_folder(self, step: Step) -> str:
+        name = self._folder_name(str(step.params.get("name", "")))
+        parent_raw = str(step.params.get("parent", "")).strip()
+        parent = self._resolve_path(parent_raw) if parent_raw else self._work_dir
+
+        target = Path(name)
+        folder = target if target.is_absolute() else parent / target
+        set_as_work = bool(step.params.get("set_as_work", True))
+
+        # 「CSV をまとめる」がここを読む。確認実行でも覚えておく
+        self._created_folder = folder
+
+        if self._dry_run:
+            # 作りはしないが、以降の手順の基準は追随させる。そうしないと
+            # 確認実行のときだけ保存先が食い違う
+            state = "既にあります" if folder.is_dir() else "この名前で作ります"
+            if set_as_work:
+                self._set_work_dir(folder)
+            return f"{folder}（{state}）"
+
+        existed = folder.is_dir()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise AutomationError(
+                f"フォルダを作れませんでした: {folder}\n{exc}"
+            ) from exc
+
+        if set_as_work:
+            self._set_work_dir(folder)
+        return f"{folder} を{'確認しました' if existed else '作りました'}"
+
+    def _do_set_work_dir(self, step: Step) -> str:
+        folder = self._resolve_path(str(step.params.get("path", "")))
+        create = bool(step.params.get("create", True))
+
+        if self._dry_run:
+            # 「フォルダを作る」を飛ばしているので、無くても失敗にしない
+            note = (
+                "あります"
+                if folder.is_dir()
+                else ("無いので実行時に作ります" if create else "まだありません")
+            )
+            self._set_work_dir(folder)
+            return f"{folder}（{note}）"
+
+        if not folder.is_dir():
+            if not create:
+                raise AutomationError(f"フォルダがありません: {folder}")
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise AutomationError(
+                    f"フォルダを作れませんでした: {folder}\n{exc}"
+                ) from exc
+
+        self._set_work_dir(folder)
+        return f"保存先を {folder} にしました"
+
+    def _do_copy_files(self, step: Step) -> str:
+        pattern = expand(str(step.params.get("source", "")), self._variables).strip()
+        from_raw = str(step.params.get("from_dir", "")).strip()
+        source_dir = self._resolve_path(from_raw) if from_raw else self._work_dir
+        dest = self._resolve_path(str(step.params.get("dest", "")))
+        move = str(step.params.get("mode", "コピー")) == "移動"
+        rename = expand(str(step.params.get("rename", "")), self._variables).strip()
+        on_exists = str(step.params.get("on_exists", "飛ばす"))
+        min_count = int(step.params.get("min_count", 1) or 0)
+        verb = "移動" if move else "コピー"
+
+        if not source_dir.is_dir():
+            if self._dry_run:
+                return f"（確認実行: {source_dir} はまだありません）"
+            raise AutomationError(f"探す場所がありません: {source_dir}")
+
+        try:
+            sources = sorted(p for p in source_dir.glob(pattern) if p.is_file())
+        except (NotImplementedError, ValueError, OSError) as exc:
+            # フルパスや空文字を入れると glob が例外を投げる。
+            # 「想定外のエラー」で終わらせず、何が悪いかを出す
+            raise AutomationError(
+                f"「{pattern}」はファイルの選び方として使えません。"
+                "［型 ▼］から選び直してください。\n"
+                f"（{exc}）"
+            ) from exc
+
+        if self._dry_run:
+            return (
+                f"{source_dir} の「{pattern}」は今 {len(sources)} 件。"
+                f"{dest} へ{verb}する予定です"
+            )
+
+        if len(sources) < min_count:
+            raise AutomationError(
+                f"{source_dir} に「{pattern}」に合うファイルが {len(sources)} 件しか"
+                f"ありません（最低 {min_count} 件）。"
+                "対象アプリが出力に失敗した可能性があります。"
+            )
+
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise AutomationError(f"行き先を作れませんでした: {dest}\n{exc}") from exc
+
+        moved = 0
+        skipped = 0
+        for number, source in enumerate(sources, start=1):
+            target = dest / self._copied_name(source, rename, number, len(sources))
+
+            if target.exists():
+                if on_exists == "飛ばす":
+                    skipped += 1
+                    continue
+                if on_exists == "エラーにする":
+                    raise AutomationError(
+                        f"{target} が既にあります。"
+                        "「行き先に同じ名前があるとき」の設定を見直してください。"
+                    )
+            if source.resolve() == target.resolve():
+                skipped += 1
+                continue
+
+            try:
+                if move:
+                    if target.exists():
+                        target.unlink()
+                    shutil.move(str(source), str(target))
+                else:
+                    shutil.copy2(source, target)
+            except OSError as exc:
+                raise AutomationError(
+                    f"{source.name} を{verb}できませんでした: {exc}"
+                ) from exc
+            moved += 1
+
+        if skipped:
+            self._emit("warn", f"  同じ名前があったので {skipped} 件を飛ばしました。")
+        return f"{moved} 件を {dest} へ{verb}しました"
+
+    @staticmethod
+    def _copied_name(source: Path, rename: str, number: int, total: int) -> str:
+        """行き先でのファイル名を決める。
+
+        付け替える名前に拡張子が無ければ元の拡張子を引き継ぐ。2 件以上を
+        同じ名前にすると上書きし合うので、そのときだけ連番を足す。
+        """
+        if not rename:
+            return source.name
+
+        suffix = Path(rename).suffix
+        base = rename[: len(rename) - len(suffix)] if suffix else rename
+        if total > 1:
+            base = f"{base}_{number:02d}"
+        return base + (suffix or source.suffix)
+
+    def _folder_name(self, raw: str) -> str:
+        """フォルダ名の差し込みを展開し、使えない文字が無いか確かめる。"""
+        name = expand(raw, self._variables).strip().strip("\\/")
+        if not name:
+            raise AutomationError("フォルダ名が空です。")
+
+        # ドライブ文字のコロンは通す（絶対パスを直に指定できるようにするため）
+        checked = name[2:] if len(name) > 1 and name[1] == ":" else name
+        bad = sorted({c for c in checked if c in _BAD_NAME_CHARS})
+        if bad:
+            raise AutomationError(
+                f"フォルダ名に使えない文字が入っています: {' '.join(bad)}\n"
+                f"（{name}）"
+            )
+        return name
+
+    def _set_work_dir(self, folder: Path) -> None:
+        """以降の手順の基準フォルダを差し替える。
+
+        相対指定のファイルは _resolve_path でここを基準に解決するので、
+        差し込み変数の {work_dir} も一緒に更新しないと食い違う。
+        """
+        self._work_dir = folder
+        self._variables["work_dir"] = str(folder)
+        self._emit("info", f"  以降の保存先: {folder}")
+
+    # ------------------------------------------------------------------
     def _do_close_app(self, step: Step) -> str:
         if self._dry_run or self._app is None:
             return "閉じる対象はありません"
@@ -796,6 +1058,13 @@ class Runner:
         expanded = expand(raw, self._variables)
         path = Path(expanded)
         return path if path.is_absolute() else self._work_dir / path
+
+    @staticmethod
+    def _stamp(when: datetime) -> str:
+        """ログに出す日時。0 時ちょうどなら日付だけにする。"""
+        if (when.hour, when.minute, when.second) == (0, 0, 0):
+            return when.strftime("%Y-%m-%d")
+        return when.strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
     def _text_of(control: UIAWrapper) -> str:

@@ -16,11 +16,21 @@ from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable
 
-from logic import schedule, storage
-from logic.actions import ACTIONS, Scenario, ScenarioError, Step
+from logic import appinfo, folder_dialog, schedule, storage
+from logic.actions import (
+    ACTIONS,
+    Scenario,
+    ScenarioError,
+    Step,
+    actions_by_category,
+    build_variables,
+    requirement_error,
+)
 from logic.picker import ElementRef
 from logic.runner import RunReport, Runner
+from ui.about_dialog import AboutDialog
 from ui.app_chooser import AppChooser
+from ui.group_chooser import GroupChooser
 from ui.picker_dialog import PickerDialog
 from ui.schedule_dialog import ScheduleDialog
 from ui.step_form import StepForm
@@ -46,9 +56,16 @@ class MainWindow(ttk.Frame):
         self._busy = False
         self._tick_id: str | None = None
         self._runner: Runner | None = None
+        # フォルダ選択は別スレッドで開くので、二重に開かないよう見張る
+        self._folder_dialog_open = False
+        self._folder_dialog_hwnd = 0
 
         self._scenario = Scenario(name="新しいシナリオ")
         self._selected = -1
+        # グループの見出しを選んでいるときの名前（手順は選ばれていない）
+        self._selected_group = ""
+        # 閉じているグループ。折りたたみは画面の状態なので保存しない
+        self._collapsed: set[str] = set()
         # 保存時点の内容。未保存の編集があるかの判定に使う
         self._saved_state: dict[str, Any] = self._scenario.to_dict()
 
@@ -57,6 +74,7 @@ class MainWindow(ttk.Frame):
 
         self._build_widgets()
         self._tick()
+        self._refresh_steps()   # 手順 0 件のときの案内を最初から出すため
         self._reload_scenario_list()
 
     # ------------------------------------------------------------------
@@ -122,6 +140,28 @@ class MainWindow(ttk.Frame):
             buttons, text="スケジュール...", command=self._on_schedule
         ).grid(row=0, column=5, padx=2)
 
+        # 右端に版を出す。まだ作成中であることを、画面を見ただけで
+        # 分かるようにしておく（押すと用途と注意点の小窓が開く）
+        self._version_label = ttk.Label(
+            bar,
+            text=appinfo.short_label(),
+            foreground="#b7791f" if appinfo.IS_BETA else "#888888",
+            cursor="hand2",
+        )
+        self._version_label.grid(row=0, column=4, sticky="e", padx=(16, 0))
+        self._version_label.bind("<Button-1>", lambda _e: self._on_about())
+
+        # 押せると分かるように、乗せたら下線を引く
+        base = ("Meiryo UI", 9)
+        self._version_label.bind(
+            "<Enter>",
+            lambda _e: self._version_label.configure(font=(*base, "underline")),
+        )
+        self._version_label.bind(
+            "<Leave>", lambda _e: self._version_label.configure(font=base)
+        )
+        self._version_label.configure(font=base)
+
     def _build_body(self) -> None:
         body = ttk.Panedwindow(self, orient="horizontal")
         body.grid(row=1, column=0, sticky="nsew")
@@ -141,11 +181,21 @@ class MainWindow(ttk.Frame):
             row=0, column=0, sticky="w"
         )
 
+        # 操作の種類は増え続けるので、平らに並べず分類ごとの入れ子にする。
+        # 分類は logic/actions.py 側に書いてあり、ここは組み立てるだけ
         self._add_menu = tk.Menu(self, tearoff=False)
-        for action, spec in ACTIONS.items():
-            self._add_menu.add_command(
-                label=spec.label, command=lambda a=action: self._on_add_step(a)
-            )
+        self._add_submenus: list[tk.Menu] = []
+        # 前提を満たしていない項目を出す前に無効化するので、場所を覚えておく
+        self._add_entries: list[tuple[tk.Menu, int, str]] = []
+        for category, items in actions_by_category():
+            submenu = tk.Menu(self._add_menu, tearoff=False)
+            for position, (action, spec) in enumerate(items):
+                submenu.add_command(
+                    label=spec.label, command=lambda a=action: self._on_add_step(a)
+                )
+                self._add_entries.append((submenu, position, action))
+            self._add_menu.add_cascade(label=category, menu=submenu)
+            self._add_submenus.append(submenu)
 
         self._add_button = ttk.Button(
             header,
@@ -155,9 +205,19 @@ class MainWindow(ttk.Frame):
         )
         self._add_button.grid(row=0, column=1, sticky="e")
 
-        self._steps = tk.Listbox(left, font=("Meiryo UI", 10), activestyle="none")
+        # 手順はグループで束ねられる（見出しだけで、実行順は上から 1 本のまま）。
+        # 複数選んでまとめて束ねたいので extended にする
+        self._steps = ttk.Treeview(left, show="tree", selectmode="extended")
+        self._steps.column("#0", width=360, stretch=True)
         self._steps.grid(row=1, column=0, sticky="nsew")
-        self._steps.bind("<<ListboxSelect>>", lambda _e: self._on_step_selected())
+        self._steps.bind("<<TreeviewSelect>>", lambda _e: self._on_step_selected())
+        self._steps.bind("<<TreeviewOpen>>", lambda _e: self._on_group_toggled(True))
+        self._steps.bind("<<TreeviewClose>>", lambda _e: self._on_group_toggled(False))
+
+        self._steps.tag_configure("group", font=("Meiryo UI", 10, "bold"))
+        self._steps.tag_configure("step", font=("Meiryo UI", 10))
+        self._steps.tag_configure("warn", foreground="#b7791f")
+        self._steps.tag_configure("off", foreground="#999999")
 
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=self._steps.yview)
         scrollbar.grid(row=1, column=1, sticky="ns")
@@ -187,6 +247,34 @@ class MainWindow(ttk.Frame):
                 row=0, column=index, padx=1
             )
         controls.columnconfigure(4, weight=1)
+
+        self._group_menu = tk.Menu(self, tearoff=False)
+        self._group_menu.add_command(
+            label="選んだ手順をまとめる...", command=self._on_group_steps
+        )
+        self._group_menu.add_command(
+            label="別のグループへ移す...", command=self._on_move_to_group
+        )
+        self._group_menu.add_command(
+            label="グループから出す", command=self._on_ungroup_steps
+        )
+        self._group_menu.add_separator()
+        self._group_menu.add_command(
+            label="グループ名を変更...", command=self._on_rename_group
+        )
+        self._group_menu.add_separator()
+        self._group_menu.add_command(
+            label="すべて折りたたむ", command=lambda: self._set_all_collapsed(True)
+        )
+        self._group_menu.add_command(
+            label="すべて展開する", command=lambda: self._set_all_collapsed(False)
+        )
+
+        # ttk.Menubutton は自前で ▾ を描くので、文字には入れない
+        self._group_button = ttk.Menubutton(
+            controls, text="グループ", menu=self._group_menu, width=10
+        )
+        self._group_button.grid(row=0, column=5, sticky="e", padx=1)
 
         right = ttk.Frame(body)
         right.columnconfigure(0, weight=1)
@@ -259,8 +347,62 @@ class MainWindow(ttk.Frame):
     def choose_app(self, on_chosen: Callable[[dict[str, Any]], None]) -> None:
         AppChooser(self, lambda params: (on_chosen(params), self._refresh_steps()))
 
+    def choose_folder(
+        self, initial: Path, title: str, on_chosen: Callable[[Path], None]
+    ) -> None:
+        """フォルダ選択を開く。
+
+        tkinter の askdirectory は使えない（pywinauto が COM を MTA に
+        するため固まる）。専用スレッドを STA で立てて開き、結果は
+        いつもどおり queue 経由でメインスレッドに戻す。
+        """
+        if self._folder_dialog_open:
+            return
+        self._folder_dialog_open = True
+        self._folder_dialog_hwnd = 0
+
+        def opened(hwnd: int) -> None:
+            # ワーカースレッドから呼ばれる。閉じるときに片付けるため覚えるだけ
+            self._folder_dialog_hwnd = hwnd
+
+        def worker() -> None:
+            try:
+                chosen = folder_dialog.choose_folder(initial, title, opened)
+            except folder_dialog.FolderDialogError as exc:
+                self._queue.put((self._on_folder_error, exc))
+            else:
+                self._queue.put((self._on_folder_chosen, (chosen, on_chosen)))
+
+        threading.Thread(
+            target=worker, name="win_rpa-folder", daemon=True
+        ).start()
+
+    def _on_folder_chosen(
+        self, payload: tuple[Path | None, Callable[[Path], None]]
+    ) -> None:
+        chosen, on_chosen = payload
+        self._folder_dialog_open = False
+        self._folder_dialog_hwnd = 0
+        if chosen is None:
+            return
+        on_chosen(chosen)
+        self._refresh_steps()
+
+    def _on_folder_error(self, exc: Exception) -> None:
+        self._folder_dialog_open = False
+        self._folder_dialog_hwnd = 0
+        messagebox.showerror("フォルダを選べませんでした", str(exc), parent=self)
+
     def work_dir(self) -> Path:
         return self._scenario.resolved_work_dir(storage.work_root())
+
+    def variables(self) -> dict[str, str]:
+        """差し込み変数の今の値。フォルダ名のプレビューに使う。
+
+        実行時に切り替わる保存先までは追えないので、ここで出るのは
+        「出発点のフォルダで組んだらこうなる」という目安。
+        """
+        return build_variables(self.work_dir(), scenario_name=self._scenario.name)
 
     # ------------------------------------------------------------------
     # シナリオ
@@ -273,6 +415,12 @@ class MainWindow(ttk.Frame):
         elif names and not self._scenario_var.get():
             self._scenario_var.set(names[0])
             self._on_scenario_selected()
+
+    def _reset_selection(self) -> None:
+        """シナリオを入れ替えるときに、選択と折りたたみを初期に戻す。"""
+        self._selected = -1
+        self._selected_group = ""
+        self._collapsed.clear()
 
     def _is_dirty(self) -> bool:
         """未保存の編集があるか。"""
@@ -310,7 +458,7 @@ class MainWindow(ttk.Frame):
             messagebox.showerror("エラー", str(exc), parent=self)
             return
 
-        self._selected = -1
+        self._reset_selection()
         self._saved_state = self._scenario.to_dict()
         self._refresh_steps()
         self._form.show(None)
@@ -334,7 +482,7 @@ class MainWindow(ttk.Frame):
             return
 
         self._scenario = Scenario(name=name)
-        self._selected = -1
+        self._reset_selection()
         self._refresh_steps()
         self._form.show(None)
         self._on_save()
@@ -409,7 +557,7 @@ class MainWindow(ttk.Frame):
             )
 
         self._scenario = Scenario(name="新しいシナリオ")
-        self._selected = -1
+        self._reset_selection()
         self._saved_state = self._scenario.to_dict()
         self._scenario_var.set("")
         self._reload_scenario_list()
@@ -463,6 +611,9 @@ class MainWindow(ttk.Frame):
                 parent=self,
             )
 
+    def _on_about(self) -> None:
+        AboutDialog(self)
+
     def _on_schedule(self) -> None:
         if not self._scenario.name.strip():
             messagebox.showinfo("スケジュール", "先にシナリオを保存してください。",
@@ -473,8 +624,37 @@ class MainWindow(ttk.Frame):
     # ------------------------------------------------------------------
     # 手順
     # ------------------------------------------------------------------
+    def _insert_position(self) -> int:
+        """次の手順を差し込む位置。"""
+        if self._selected >= 0:
+            return self._selected + 1
+        if self._selected_group:
+            block = self._block_of_group(self._selected_group)
+            if block:
+                return block[1][-1] + 1
+        return len(self._scenario.steps)
+
+    def _refresh_add_menu_states(self) -> None:
+        """前に必要な手順が無い操作を、選べない状態にする。
+
+        選べてしまうと、実行するまで成り立たないことに気づけない。
+        理由をラベルに入れて、なぜ押せないかをその場で分かるようにする。
+        """
+        earlier = self._scenario.steps[: self._insert_position()]
+
+        for menu, position, action in self._add_entries:
+            spec = ACTIONS[action]
+            problem = requirement_error(spec, earlier)
+            menu.entryconfigure(
+                position,
+                state="disabled" if problem else "normal",
+                label=f"{spec.label}（{problem}）" if problem else spec.label,
+            )
+
     def _popup_add_menu(self) -> None:
         """追加メニューをボタンの真下に出す。"""
+        self._refresh_add_menu_states()
+
         button = self._add_button
         x = button.winfo_rootx()
         y = button.winfo_rooty() + button.winfo_height()
@@ -484,20 +664,44 @@ class MainWindow(ttk.Frame):
             self._add_menu.grab_release()
 
     def _refresh_steps(self) -> None:
+        """一覧を組み直す。グループは見出しの親ノードとして出す。"""
         selection = self._selected
-        self._steps.delete(0, tk.END)
+        selected_group = self._selected_group
 
-        for index, step in enumerate(self._scenario.steps, start=1):
-            mark = "" if step.enabled else "（無効）"
-            problems = step.validate()
-            flag = " ⚠" if problems else ""
-            self._steps.insert(tk.END, f" {index:>2}. {step.describe()}{mark}{flag}")
-            if problems:
-                self._steps.itemconfigure(index - 1, foreground="#b7791f")
+        self._steps.delete(*self._steps.get_children())
 
-        if 0 <= selection < self._steps.size():
-            self._steps.selection_set(selection)
-            self._selected = selection
+        for block, (group, indices) in enumerate(self._scenario.groups()):
+            parent = ""
+            if group:
+                parent = f"g{block}"
+                self._steps.insert(
+                    "",
+                    "end",
+                    iid=parent,
+                    text=f"　{group}（{len(indices)} 手順）",
+                    open=group not in self._collapsed,
+                    tags=("group",),
+                )
+
+            for index in indices:
+                step = self._scenario.steps[index]
+                mark = "" if step.enabled else "（無効）"
+                problems = self._scenario.step_problems(index)
+                flag = " ⚠" if problems else ""
+                tags = ["step"]
+                if problems:
+                    tags.append("warn")
+                if not step.enabled:
+                    tags.append("off")
+                self._steps.insert(
+                    parent,
+                    "end",
+                    iid=f"s{index}",
+                    text=f" {index + 1:>2}. {step.describe()}{mark}{flag}",
+                    tags=tuple(tags),
+                )
+
+        self._restore_selection(selection, selected_group)
 
         # 空のときは案内を一覧の上に重ねる
         if self._scenario.steps:
@@ -506,34 +710,128 @@ class MainWindow(ttk.Frame):
             self._empty_hint.grid(row=1, column=0, sticky="nsew")
             self._empty_hint.lift()
 
+    def _restore_selection(self, index: int, group: str) -> None:
+        """組み直したあとに、選んでいたものを選び直す。"""
+        if 0 <= index < len(self._scenario.steps):
+            iid = f"s{index}"
+            if self._steps.exists(iid):
+                self._steps.see(iid)
+                self._steps.selection_set(iid)
+                self._selected = index
+                self._selected_group = ""
+                return
+
+        if group:
+            for block, (name, _) in enumerate(self._scenario.groups()):
+                if name == group and self._steps.exists(f"g{block}"):
+                    self._steps.selection_set(f"g{block}")
+                    self._selected = -1
+                    self._selected_group = group
+                    return
+
+        self._selected = -1
+        self._selected_group = ""
+
+    def _selected_indices(self) -> list[int]:
+        """選ばれている手順の位置を、上から順に返す。
+
+        グループの見出しを選んでいるときは、その中の手順すべてを指す。
+        """
+        indices: set[int] = set()
+        blocks = self._scenario.groups()
+
+        for iid in self._steps.selection():
+            if iid.startswith("s"):
+                indices.add(int(iid[1:]))
+            elif iid.startswith("g"):
+                block = int(iid[1:])
+                if block < len(blocks):
+                    indices.update(blocks[block][1])
+        return sorted(indices)
+
     def _on_step_selected(self) -> None:
-        selection = self._steps.curselection()
+        selection = self._steps.selection()
         if not selection:
             return
         self._form.collect()
-        self._selected = selection[0]
+
+        iid = selection[0]
+        if iid.startswith("g"):
+            blocks = self._scenario.groups()
+            block = int(iid[1:])
+            self._selected = -1
+            self._selected_group = blocks[block][0] if block < len(blocks) else ""
+            self._form.show(None)
+            return
+
+        self._selected = int(iid[1:])
+        self._selected_group = ""
         self._form.show(self._scenario.steps[self._selected])
+
+    def _on_group_toggled(self, opened: bool) -> None:
+        """折りたたみの状態を覚える。組み直しても畳んだままにするため。"""
+        iid = self._steps.focus()
+        if not iid.startswith("g"):
+            return
+        blocks = self._scenario.groups()
+        block = int(iid[1:])
+        if block >= len(blocks):
+            return
+        name = blocks[block][0]
+        if opened:
+            self._collapsed.discard(name)
+        else:
+            self._collapsed.add(name)
 
     def _on_add_step(self, action: str) -> None:
         self._form.collect()
+        insert_at = self._insert_position()
+
+        # メニューでは無効にしてあるが、経路が増えても素通りしないよう確かめる
+        problem = requirement_error(
+            ACTIONS[action], self._scenario.steps[:insert_at]
+        )
+        if problem:
+            messagebox.showinfo(
+                "この操作はまだ入れられません",
+                f"「{ACTIONS[action].label}」は{problem}。\n\n"
+                "先にその手順を追加してから、もう一度選んでください。",
+                parent=self,
+            )
+            return
+
         step = Step(action=action)
         for field in step.spec.fields:
             if field.default is not None:
                 step.params[field.key] = field.default
 
-        insert_at = self._selected + 1 if self._selected >= 0 else len(
-            self._scenario.steps
-        )
+        if self._selected >= 0:
+            # 直前の手順と同じグループに入れる。追加のたびに束ね直さなくて済む
+            step.group = self._scenario.steps[self._selected].group
+        elif self._selected_group:
+            step.group = self._selected_group
+
         self._scenario.steps.insert(insert_at, step)
         self._selected = insert_at
+        self._selected_group = ""
         self._refresh_steps()
         self._form.show(step)
 
     def _on_delete_step(self) -> None:
-        if self._selected < 0:
+        indices = self._selected_indices()
+        if not indices:
             return
-        del self._scenario.steps[self._selected]
-        self._selected = min(self._selected, len(self._scenario.steps) - 1)
+
+        if len(indices) > 1 and not messagebox.askyesno(
+            "確認", f"選んだ {len(indices)} 件の手順を削除しますか。", parent=self
+        ):
+            return
+
+        for index in reversed(indices):
+            del self._scenario.steps[index]
+
+        self._selected = min(indices[0], len(self._scenario.steps) - 1)
+        self._selected_group = ""
         self._refresh_steps()
         self._form.show(
             self._scenario.steps[self._selected] if self._selected >= 0 else None
@@ -544,20 +842,65 @@ class MainWindow(ttk.Frame):
             return
         self._form.collect()
         source = self._scenario.steps[self._selected]
-        copy = Step(action=source.action, params=dict(source.params))
+        copy = Step(
+            action=source.action, params=dict(source.params), group=source.group
+        )
         self._scenario.steps.insert(self._selected + 1, copy)
         self._selected += 1
         self._refresh_steps()
         self._form.show(copy)
 
     def _move(self, delta: int) -> None:
-        target = self._selected + delta
-        if self._selected < 0 or not 0 <= target < len(self._scenario.steps):
+        """選んでいる手順（またはグループ）を 1 つ動かす。"""
+        if self._selected_group:
+            self._move_group(delta)
             return
+        if self._selected < 0:
+            return
+
         self._form.collect()
         steps = self._scenario.steps
-        steps[self._selected], steps[target] = steps[target], steps[self._selected]
-        self._selected = target
+        source = self._selected
+        target = source + delta
+
+        if not 0 <= target < len(steps):
+            # 一覧の端。グループに入っていれば、そこから出すだけにする
+            if steps[source].group:
+                steps[source].group = ""
+                self._refresh_steps()
+            return
+
+        if steps[target].group != steps[source].group:
+            # グループの境目。まず境を越えさせ、次の押下で入れ替える。
+            # 1 回で両方やると、境目でグループを移せなくなる
+            steps[source].group = steps[target].group
+        else:
+            steps[source], steps[target] = steps[target], steps[source]
+            self._selected = target
+
+        self._refresh_steps()
+
+    def _move_group(self, delta: int) -> None:
+        """グループごと、隣の塊と入れ替える。"""
+        self._form.collect()
+        blocks = self._scenario.groups()
+        position = next(
+            (i for i, (name, _) in enumerate(blocks) if name == self._selected_group),
+            None,
+        )
+        if position is None:
+            return
+
+        other = position + delta
+        if not 0 <= other < len(blocks):
+            return
+
+        first, second = sorted((position, other))
+        steps = self._scenario.steps
+        head = blocks[first][1]
+        tail = blocks[second][1]
+        moved = [steps[i] for i in tail] + [steps[i] for i in head]
+        self._scenario.steps = steps[: head[0]] + moved + steps[tail[-1] + 1 :]
         self._refresh_steps()
 
     def _on_move_up(self) -> None:
@@ -565,6 +908,106 @@ class MainWindow(ttk.Frame):
 
     def _on_move_down(self) -> None:
         self._move(1)
+
+    # ------------------------------------------------------------------
+    # グループ
+    # ------------------------------------------------------------------
+    def _block_of_group(self, name: str) -> tuple[str, list[int]] | None:
+        return next(
+            (block for block in self._scenario.groups() if block[0] == name), None
+        )
+
+    def _apply_group(self, indices: list[int], name: str) -> None:
+        """選んだ手順を 1 つのグループにし、離れていたら寄せる。"""
+        self._form.collect()
+        steps = self._scenario.steps
+        for index in indices:
+            steps[index].group = name
+
+        # 選んだものが飛び飛びでも、先頭の位置に集める
+        chosen = set(indices)
+        picked = [steps[i] for i in indices]
+        rest = [step for i, step in enumerate(steps) if i not in chosen]
+        before = sum(1 for i in range(indices[0]) if i not in chosen)
+
+        self._scenario.steps = rest[:before] + picked + rest[before:]
+        self._scenario.normalize_groups()
+
+        # 同じ内容の手順が並ぶことがあるので、値ではなく実体で探す
+        self._selected = next(
+            i for i, step in enumerate(self._scenario.steps) if step is picked[0]
+        )
+        self._selected_group = ""
+        self._refresh_steps()
+
+    def _ask_group_name(self, title: str, initial: str = "") -> str | None:
+        name = simpledialog.askstring(
+            title, "グループ名", initialvalue=initial, parent=self
+        )
+        return name.strip() if name else None
+
+    def _on_group_steps(self) -> None:
+        indices = self._selected_indices()
+        if not indices:
+            messagebox.showinfo(
+                "グループ", "まとめる手順を一覧で選んでください。", parent=self
+            )
+            return
+
+        name = self._ask_group_name("選んだ手順をまとめる")
+        if not name:
+            return
+        self._apply_group(indices, name)
+        self._status_var.set(f"{len(indices)} 手順を「{name}」にまとめました")
+
+    def _on_move_to_group(self) -> None:
+        indices = self._selected_indices()
+        if not indices:
+            return
+
+        names = self._scenario.group_names()
+        if not names:
+            self._on_group_steps()
+            return
+
+        GroupChooser(self, names, lambda name: self._apply_group(indices, name))
+
+    def _on_ungroup_steps(self) -> None:
+        indices = self._selected_indices()
+        if not indices:
+            return
+        self._apply_group(indices, "")
+        self._status_var.set(f"{len(indices)} 手順をグループから出しました")
+
+    def _on_rename_group(self) -> None:
+        old = self._selected_group
+        if not old:
+            messagebox.showinfo(
+                "グループ名を変更", "一覧でグループの見出しを選んでください。",
+                parent=self,
+            )
+            return
+
+        name = self._ask_group_name("グループ名を変更", old)
+        if not name or name == old:
+            return
+
+        for step in self._scenario.steps:
+            if step.group == old:
+                step.group = name
+
+        self._collapsed.discard(old)
+        self._scenario.normalize_groups()
+        self._selected_group = name
+        self._refresh_steps()
+        self._status_var.set(f"「{old}」を「{name}」に変更しました")
+
+    def _set_all_collapsed(self, collapsed: bool) -> None:
+        if collapsed:
+            self._collapsed = set(self._scenario.group_names())
+        else:
+            self._collapsed.clear()
+        self._refresh_steps()
 
     # ------------------------------------------------------------------
     # 実行
@@ -702,6 +1145,10 @@ class MainWindow(ttk.Frame):
         """ウィンドウを閉じるときに呼ぶ。定期処理とスレッドを確実に止める。"""
         if self._runner is not None:
             self._runner.cancel()
+        # 開きっぱなしのフォルダ選択を閉じる。放っておくと
+        # ダイアログを抱えたスレッドが残ったまま画面だけ消える
+        folder_dialog.close_dialog(self._folder_dialog_hwnd)
+        self._folder_dialog_hwnd = 0
         if self._tick_id is not None:
             self.after_cancel(self._tick_id)
             self._tick_id = None
