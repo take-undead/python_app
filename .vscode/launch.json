@@ -29,6 +29,15 @@
       "justMyCode": true
     },
     {
+      "name": "win_rpa",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/apps/win_rpa/main.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
       "name": "現在のファイル",
       "type": "debugpy",
       "request": "launch",

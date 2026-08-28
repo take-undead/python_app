@@ -46,6 +46,7 @@ requirements.txt         # 全アプリ共有の依存
 tools/
   new_app.py             # 新しいアプリの雛形を生成する
   build.py               # アプリを実行ファイルにまとめる（成果物は build/ 配下）
+  make_shortcut.py       # エクスプローラーから起動するショートカットを作る
 build/                   # ビルド生成物（Git 管理外）
 common/                  # 複数アプリで使う共通コード（必要になってから作る）
 apps/
@@ -63,6 +64,7 @@ apps/
 | `webcam` | `python apps/webcam/main.py` | Web カメラの映像表示と静止画保存 |
 | `webpin` | `python apps/webpin/main.py` | ESP32 のピン情報を WebSocket で受信し、グラフ表示と CSV ロギング |
 | `esp32cam` | `python apps/esp32cam/main.py` | ESP32-CAM 6 台の MJPEG 映像同時表示、撮影指示、SD カード内の写真閲覧（**参照実装**） |
+| `win_rpa` | `python apps/win_rpa/main.py` | Windows アプリを自動操作して CSV を出力させ、結合する（月次ルーティン向け。`--run` で無人実行） |
 
 - アプリフォルダ名は英小文字とアンダースコアのみ（`python -m` でも扱えるようにするため）。
 - **アプリ間で直接 import しない。** `apps/memo` から `apps/viewer` を参照しない。共有したくなったコードは `common/` に切り出す。
@@ -188,6 +190,19 @@ def _run(self, task, on_success, busy_message) -> None:
 | 設定の保存・復元 | `apps/esp32cam/logic/settings.py` |
 | 別ウィンドウ（Toplevel） | `apps/esp32cam/ui/photo_preview.py` |
 | 同じ部品を複数並べる画面 | `apps/esp32cam/ui/camera_tile.py` |
+
+## エクスプローラーから起動する
+
+```powershell
+python tools/make_shortcut.py webpin --desktop            # デスクトップにも置く
+python tools/make_shortcut.py webpin --console            # 起動しないときの原因調査用
+python tools/make_shortcut.py webpin --name "ピン監視"
+```
+
+- **`.py` を直接ダブルクリックさせない。** `.venv` ではなくシステム側の Python が使われ、依存パッケージが無く失敗する。
+- 作られる `.lnk` は `.venv\Scripts\pythonw.exe` を指し、作業場所はリポジトリ直下になる。コンソールは出ない。
+- `.lnk` にはこの PC の絶対パスが入るため Git 管理対象外（`.gitignore` に記載）。PC ごとに作り直す。
+- コンソールなしで起動すると、起動時の例外がどこにも出ずに「ダブルクリックしても何も起きない」状態になる。`main.py` 側で例外を捕まえてログとダイアログに出すこと。
 
 ## ビルド（実行ファイル化）
 

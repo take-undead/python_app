@@ -4,7 +4,8 @@
   "python.analysis.extraPaths": [
     "apps/webcam",
     "apps/webpin",
-    "apps/esp32cam"
+    "apps/esp32cam",
+    "apps/win_rpa"
   ],
   "files.encoding": "utf8",
   "[python]": {
