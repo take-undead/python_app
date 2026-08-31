@@ -10,16 +10,18 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from pywinauto import Application, Desktop
+from PIL import ImageGrab
+from pywinauto import Application, Desktop, keyboard
 from pywinauto.controls.uiawrapper import UIAWrapper
 from pywinauto.uia_element_info import UIAElementInfo
 
@@ -28,8 +30,12 @@ from logic.actions import (
     Scenario,
     Step,
     build_variables,
+    describe_date_range,
+    describe_keys,
     expand,
+    menu_parts,
     requirement_error,
+    resolve_date_range,
 )
 from logic.picker import ElementRef, describe as describe_element
 
@@ -46,9 +52,33 @@ MATCH_PATH = "構造上の位置"
 # Windows がフォルダ名に許さない文字（\ と / は階層の区切りとして通す）
 _BAD_NAME_CHARS = '<>:"|?*'
 
+# ダイアログのボタンを押すための手がかり。
+# 共通ダイアログのボタンは日本語 Windows でも名前が英語のままなので、
+# 先に AutomationId（IDOK = 1、IDCANCEL = 2、IDYES = 6、IDNO = 7）で探す
+_DIALOG_BUTTONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "OK": (("1",), ("OK", "はい")),
+    "はい": (("6",), ("はい", "Yes")),
+    "いいえ": (("7",), ("いいえ", "No")),
+    "キャンセル": (("2",), ("キャンセル", "Cancel")),
+    "保存": (("1",), ("保存", "Save")),
+    "開く": (("1",), ("開く", "Open")),
+    "閉じる": (("2",), ("閉じる", "Close")),
+}
+
 
 class AutomationError(Exception):
     """手順の実行に失敗した。"""
+
+
+def _capture_screen(path: Path) -> None:
+    """画面全体を画像として保存する。
+
+    pywinauto の capture_as_image はウィンドウ 1 つ分を撮るもので、
+    Desktop には無い。画面ぜんぶを残したいので PIL で撮る。
+    ダイアログが別の画面に出ていても写るよう、全モニタを対象にする。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ImageGrab.grab(all_screens=True).save(path)
 
 
 @dataclass
@@ -100,9 +130,14 @@ class Runner:
         self._dry_run = dry_run
         self._on_event = on_event or (lambda kind, text: None)
 
+        # 「今日」は実行の最初に 1 度だけ決める。差し込み変数（{yyyymm}）と
+        # 更新日の絞り込みが同じ日を見るようにするため。日付をまたいで動くと、
+        # 先月ぶんを集めているのに保存先だけ翌月になる、ということが起きる
+        self._today = today or date.today()
+
         self._work_dir = scenario.resolved_work_dir(base_dir)
         self._variables = build_variables(
-            self._work_dir, today, scenario_name=scenario.name
+            self._work_dir, self._today, scenario_name=scenario.name
         )
         self._log_dir = base_dir / "logs" / datetime.now().strftime("%Y-%m")
 
@@ -213,14 +248,22 @@ class Runner:
             "set_text": self._do_set_text,
             "check": self._do_check,
             "select": self._do_select,
+            "send_keys": self._do_send_keys,
+            "menu_select": self._do_menu_select,
+            "focus_window": self._do_focus_window,
+            "dialog_button": self._do_dialog_button,
             "save_dialog": self._do_save_dialog,
+            "open_dialog": self._do_open_dialog,
             "assert_text": self._do_assert_text,
             "assert_file": self._do_assert_file,
+            "screenshot": self._do_screenshot,
             "merge_csv": self._do_merge_csv,
             "make_folder": self._do_make_folder,
             "set_work_dir": self._do_set_work_dir,
             "copy_files": self._do_copy_files,
             "close_app": self._do_close_app,
+            "wait_seconds": self._do_wait_seconds,
+            "run_program": self._do_run_program,
             "run_python": self._do_run_python,
         }
         handler = handlers.get(step.action)
@@ -316,6 +359,7 @@ class Runner:
 
     def _do_click(self, step: Step) -> str:
         ref = self._require_element(step)
+        manner = str(step.params.get("manner", "左クリック"))
         if self._dry_run:
             self._probe(ref, step)
             return "対象が見つかりました"
@@ -326,17 +370,28 @@ class Runner:
             control.set_focus()
         except Exception:  # noqa: BLE001 - 前面に出せなくても押せることがある
             pass
+
         try:
-            control.click_input()
+            if manner == "ダブルクリック":
+                control.double_click_input()
+            elif manner == "右クリック":
+                control.right_click_input()
+            else:
+                control.click_input()
         except Exception as exc:  # noqa: BLE001
-            # マウスが届かない配置のときは UIA のパターンで押す
+            # マウスが届かない配置のときは UIA のパターンで押す。
+            # invoke は左クリック相当なので、ほかの押し方では代用にならない
+            if manner != "左クリック":
+                raise AutomationError(
+                    f"{describe_element(ref)} を{manner}できませんでした: {exc}"
+                ) from exc
             try:
                 control.invoke()
             except Exception:  # noqa: BLE001
                 raise AutomationError(
                     f"{describe_element(ref)} を押せませんでした: {exc}"
                 ) from exc
-        return f"押しました（{how} で照合）"
+        return f"{manner}しました（{how} で照合）"
 
     def _do_set_text(self, step: Step) -> str:
         ref = self._require_element(step)
@@ -393,6 +448,210 @@ class Runner:
             ) from exc
         return f"「{value}」を選びました"
 
+    def _do_send_keys(self, step: Step) -> str:
+        keys = str(step.params.get("keys", "")).strip()
+        if not keys:
+            raise AutomationError("押すキーが指定されていません。")
+
+        repeat = max(1, int(step.params.get("repeat", 1) or 1))
+        label = describe_keys(keys)
+        ref = step.element()
+
+        if self._dry_run:
+            if ref is not None:
+                self._probe(ref, step)
+                return f"対象が見つかりました（{label} を {repeat} 回）"
+            return f"{label} を {repeat} 回押す予定です"
+
+        control: UIAWrapper | None = None
+        if ref is not None:
+            control, how = self._resolve(ref, self._timeout(step))
+            self._warn_if_fallback(ref, how)
+            try:
+                control.set_focus()
+            except Exception:  # noqa: BLE001 - 前面に出せなくても入ることがある
+                pass
+
+        try:
+            for _ in range(repeat):
+                if control is not None:
+                    control.type_keys(keys)
+                else:
+                    # 対象を指定していないときは、いま入力を受けている場所へ送る。
+                    # 直前の手順で選んだ欄にそのまま続けられるようにするため
+                    keyboard.send_keys(keys)
+        except Exception as exc:  # noqa: BLE001
+            raise AutomationError(f"{label} を送れませんでした: {exc}") from exc
+
+        return f"{label} を {repeat} 回押しました"
+
+    def _do_menu_select(self, step: Step) -> str:
+        parts = menu_parts(expand(str(step.params.get("path", "")), self._variables))
+        if not parts:
+            raise AutomationError("たどるメニューが指定されていません。")
+
+        shown = " > ".join(parts)
+        if self._dry_run:
+            return f"「{shown}」をたどる予定です"
+
+        timeout = self._timeout(step)
+        for position, name in enumerate(parts):
+            # 1 つめはメニューバーなので待つ価値があるが、開いたあとの項目は
+            # すぐ出ている。待ち時間を短くして、綴り違いに早く気づけるようにする
+            item = self._find_menu_item(name, timeout if position == 0 else 5, shown)
+            try:
+                item.click_input()
+            except Exception as exc:  # noqa: BLE001
+                raise AutomationError(
+                    f"メニュー「{name}」を選べませんでした: {exc}"
+                ) from exc
+            time.sleep(_POLL_SEC)
+
+        return f"「{shown}」を選びました"
+
+    def _find_menu_item(self, name: str, timeout: float, shown: str) -> UIAWrapper:
+        """メニューの項目を名前で探す。
+
+        開いたメニューは、アプリの画面とは別の最上位ウィンドウとして出る。
+        そのため、要素の照合（_resolve）ではなく、対象アプリが持つ
+        ウィンドウ全部を見て回る。
+        """
+        deadline = time.monotonic() + timeout
+        searched = False
+        while True:
+            windows = self._menu_windows()
+            searched = searched or bool(windows)
+
+            for window in windows:
+                try:
+                    for control in window.descendants(control_type="MenuItem"):
+                        if control.window_text() == name:
+                            return control
+                except Exception:  # noqa: BLE001 - 閉じた直後のウィンドウは飛ばす
+                    continue
+
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_POLL_SEC)
+
+        if not searched:
+            raise AutomationError(
+                "メニューをたどる対象のアプリがありません。\n"
+                "先に「アプリを起動する」か「ウィンドウを前面に出す」の手順を"
+                "入れてください。"
+            )
+        raise AutomationError(
+            f"メニュー「{name}」が見つかりませんでした（たどる順: {shown}）。\n"
+            "名前が変わったか、そこまで開けていない可能性があります。"
+        )
+
+    def _menu_windows(self) -> list[Any]:
+        """メニューを探す対象のウィンドウ。
+
+        探す範囲をプロセス単位に絞る。デスクトップ全体を走査すると、
+        画面上のすべてのアプリの要素をたどることになり終わらない。
+
+        起動したプロセスが 1 つもウィンドウを持たないことがある
+        （ランチャー型のアプリ。メモ帳がこの形）。そのときだけ、いま
+        手前にあるウィンドウのプロセスに広げる。無条件に広げると、
+        対象アプリの起動に失敗したときに**関係の無いアプリのメニューを
+        操作してしまう**ので、アプリを掴んでいることを条件にする。
+        """
+        if self._app is None:
+            return []
+
+        windows = self._windows_of(getattr(self._app, "process", None))
+        if windows:
+            return windows
+
+        handle = winfind.foreground_window()
+        if handle is None:
+            return []
+        pid = winfind.process_of(handle)
+        # 自分（この操作画面）の中を探しても意味がない
+        return [] if pid == os.getpid() else self._windows_of(pid)
+
+    @staticmethod
+    def _windows_of(pid: int | None) -> list[Any]:
+        """そのプロセスが持つ最上位ウィンドウ。開いたメニューもここに出る。"""
+        if not pid:
+            return []
+        windows: list[Any] = []
+        for hwnd in winfind.find_windows(pid=int(pid)):
+            try:
+                windows.append(winfind.spec(hwnd))
+            except OSError:
+                continue
+        return windows
+
+    def _do_focus_window(self, step: Step) -> str:
+        title = expand(str(step.params.get("title", "")), self._variables)
+        timeout = self._timeout(step, default=30)
+
+        if self._dry_run:
+            state = "出ています" if winfind.find_windows(title=title) else "まだ出ていません"
+            return f"「{title}」は今 {state}"
+
+        hwnd = self._wait_window_handle(title, timeout)
+        try:
+            winfind.spec(hwnd).wrapper_object().set_focus()
+        except Exception as exc:  # noqa: BLE001
+            raise AutomationError(
+                f"「{title}」を前面に出せませんでした: {exc}"
+            ) from exc
+
+        # 以降の手順が同じウィンドウを対象にできるよう、
+        # そのウィンドウを持っているプロセスへ結び直す
+        self._rebind_to_window(title)
+        return f"「{title}」を前面に出しました"
+
+    def _do_dialog_button(self, step: Step) -> str:
+        title = expand(str(step.params.get("dialog_title", "")), self._variables).strip()
+        button = str(step.params.get("button", "OK"))
+        optional = bool(step.params.get("optional", True))
+        timeout = self._timeout(step, default=10)
+
+        where = f"「{title}」" if title else "出ているメッセージ"
+        if self._dry_run:
+            return f"{where}の「{button}」を押す予定です"
+
+        auto_ids, names = _DIALOG_BUTTONS.get(button, ((), (button,)))
+
+        deadline = time.monotonic() + timeout
+        dialog: Any = None
+        while True:
+            dialog = self._find_dialog(title)
+            if dialog is not None:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_POLL_SEC)
+
+        if dialog is None:
+            if optional:
+                return f"{where}は出ていなかったので飛ばしました"
+            raise AutomationError(
+                f"{where}が {timeout} 秒以内に出ませんでした。"
+            )
+
+        if not self._click_dialog_button(dialog, auto_ids, names):
+            raise AutomationError(
+                f"{where}に「{button}」ボタンが見つかりませんでした。"
+            )
+        return f"{where}の「{button}」を押しました"
+
+    def _find_dialog(self, title: str) -> Any:
+        """応じる対象のダイアログを探す。題名が空なら、出ているものを使う。"""
+        pid = getattr(self._app, "process", None) if self._app is not None else None
+        if title:
+            # 共通ダイアログ（#32770）を先に見るが、アプリが自前で作った
+            # 確認画面はふつうのウィンドウなので、題名が分かっているなら
+            # そちらも受け入れる
+            return winfind.find_dialog(title, pid) or winfind.find_window(title, pid)
+        # 題名を決めていないときに、自分（この操作画面）のダイアログを
+        # 押してしまわないよう除く
+        return winfind.find_any_dialog(pid, exclude_pid=os.getpid())
+
     def _do_save_dialog(self, step: Step) -> str:
         path = self._resolve_path(str(step.params.get("path", "")))
         title = expand(
@@ -420,6 +679,31 @@ class Runner:
         # 上書き確認が出ることがある
         self._dismiss_overwrite_prompt()
         return f"{path.name} に保存しました"
+
+    def _do_open_dialog(self, step: Step) -> str:
+        path = self._resolve_path(str(step.params.get("path", "")))
+        title = expand(str(step.params.get("dialog_title", "開く")), self._variables)
+        timeout = self._timeout(step, default=30)
+
+        if self._dry_run:
+            state = "あります" if path.is_file() else "まだありません"
+            return f"開く予定: {path}（{state}）"
+
+        if not path.is_file():
+            raise AutomationError(
+                f"開くファイルがありません: {path}\n"
+                "前の手順で作られるはずのファイルなら、そこが失敗しています。"
+            )
+
+        hwnd = self._wait_window_handle(title, timeout)
+        self._set_dialog_filename(hwnd, path)
+
+        # IDOK = 1。共通ダイアログのボタン名は日本語 Windows でも Open のまま
+        if not self._click_dialog_button(
+            winfind.spec(hwnd), ("1",), ("開く", "Open", "OK")
+        ):
+            raise AutomationError("開くダイアログの「開く」ボタンが見つかりませんでした。")
+        return f"{path.name} を開きました"
 
     def _set_dialog_filename(self, hwnd: int, path: Path) -> None:
         """保存ダイアログの「ファイル名」欄にパスを入れる。
@@ -511,6 +795,24 @@ class Runner:
                 "対象アプリの出力が空の可能性があります。"
             )
         return f"{path.name}（{rows} 行）を確認しました"
+
+    def _do_screenshot(self, step: Step) -> str:
+        raw = expand(str(step.params.get("name", "")), self._variables).strip()
+        name = Path(raw.replace("\\", "/")).name
+        if not name:
+            raise AutomationError("画像の名前が指定されていません。")
+        if not name.lower().endswith(".png"):
+            name += ".png"
+
+        path = self._work_dir / name
+        if self._dry_run:
+            return f"保存予定: {path}"
+
+        try:
+            _capture_screen(path)
+        except OSError as exc:
+            raise AutomationError(f"画面を保存できませんでした: {exc}") from exc
+        return f"{path} に保存しました"
 
     def _do_merge_csv(self, step: Step) -> str:
         """作ったフォルダの CSV を全部まとめ、日付順に並べて同じ場所に置く。
@@ -680,17 +982,35 @@ class Runner:
                 f"（{exc}）"
             ) from exc
 
+        found = len(sources)
+        sources, when = self._filter_by_modified(sources, step)
+        narrowed = (
+            f"、更新日が {when} のものは {len(sources)} 件" if when else ""
+        )
+
         if self._dry_run:
             return (
-                f"{source_dir} の「{pattern}」は今 {len(sources)} 件。"
+                f"{source_dir} の「{pattern}」は今 {found} 件{narrowed}。"
                 f"{dest} へ{verb}する予定です"
+            )
+
+        if when:
+            self._emit(
+                "info",
+                f"  「{pattern}」は {found} 件。"
+                f"そのうち更新日が {when} のものは {len(sources)} 件です。",
             )
 
         if len(sources) < min_count:
             raise AutomationError(
                 f"{source_dir} に「{pattern}」に合うファイルが {len(sources)} 件しか"
                 f"ありません（最低 {min_count} 件）。"
-                "対象アプリが出力に失敗した可能性があります。"
+                + (
+                    f"\n更新日を「{when}」で絞っています"
+                    f"（絞る前は {found} 件）。範囲が合っているか確かめてください。"
+                    if when
+                    else "対象アプリが出力に失敗した可能性があります。"
+                )
             )
 
         try:
@@ -732,6 +1052,36 @@ class Runner:
         if skipped:
             self._emit("warn", f"  同じ名前があったので {skipped} 件を飛ばしました。")
         return f"{moved} 件を {dest} へ{verb}しました"
+
+    def _filter_by_modified(
+        self, sources: list[Path], step: Step
+    ) -> tuple[list[Path], str]:
+        """更新日で対象を絞る。絞った一覧と、範囲の言い方を返す。
+
+        ファイル名に日付が入っていない出力を「先月ぶんだけ」運ぶために使う。
+        範囲は選ばせるので、ここに来るのは解決済みの型だけ。
+        """
+        setting = step.params.get("modified")
+        when = describe_date_range(setting, self._today)
+        if not when:
+            return sources, ""
+
+        start, end = resolve_date_range(setting, self._today)
+        if start is None or end is None:
+            return sources, ""
+
+        kept: list[Path] = []
+        for path in sources:
+            try:
+                modified = datetime.fromtimestamp(path.stat().st_mtime)
+            except OSError:
+                # 読めないものは落とさず残す。数が合わなければ
+                # 「最低件数」で止まるので、ここで黙って消すほうが危ない
+                kept.append(path)
+                continue
+            if start <= modified <= end:
+                kept.append(path)
+        return kept, when
 
     @staticmethod
     def _copied_name(source: Path, rename: str, number: int, total: int) -> str:
@@ -785,6 +1135,83 @@ class Runner:
             pass
         self._app = None
         return "閉じました"
+
+    def _do_wait_seconds(self, step: Step) -> str:
+        try:
+            seconds = max(0, int(step.params.get("seconds", 0) or 0))
+        except (TypeError, ValueError):
+            raise AutomationError("待つ秒数が数値ではありません。") from None
+
+        if self._dry_run:
+            return f"{seconds} 秒待つ予定です"
+
+        # 一息に sleep せず刻む。［中止］を押してから最大 5 分待たされないため
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._cancelled:
+                return f"{seconds} 秒待つ途中で中止しました"
+            time.sleep(min(_POLL_SEC, max(0.0, deadline - time.monotonic())))
+        return f"{seconds} 秒待ちました"
+
+    def _do_run_program(self, step: Step) -> str:
+        app_info = step.params.get("app") or {}
+        target = Path(str(app_info.get("target", "")))
+        args = expand(str(app_info.get("args", "")), self._variables)
+        wait_exit = bool(step.params.get("wait_exit", True))
+        timeout = self._timeout(step, default=300)
+        work_dir = app_info.get("work_dir") or str(self._work_dir)
+
+        if not target.is_file():
+            raise AutomationError(
+                f"プログラムが見つかりません: {target}\n"
+                "この PC では場所が違う可能性があります。選び直してください。"
+            )
+
+        # ショートカットや関連付けは CreateProcess が解決しないので、
+        # 「アプリを起動する」と同じ手順で実体まで落とす
+        if target.suffix.lower() not in launch.RUNNABLE_SUFFIXES:
+            try:
+                found = launch.resolve_launch(target)
+            except launch.LaunchError as exc:
+                raise AutomationError(f"実行できません: {exc}") from exc
+            args = f"{found.args} {args}".strip()
+            work_dir = str(found.work_dir) if found.work_dir else work_dir
+            target = found.exe
+
+        if self._dry_run:
+            return f"実行できる状態です（{target.name}）"
+
+        command = [str(target), *args.split()]
+        if not wait_exit:
+            try:
+                subprocess.Popen(command, cwd=work_dir)
+            except OSError as exc:
+                raise AutomationError(f"{target.name} を実行できませんでした: {exc}") from exc
+            return f"{target.name} を起動しました（終わるのは待ちません）"
+
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AutomationError(
+                f"{target.name} が {timeout} 秒で終わりませんでした。"
+            ) from exc
+        except OSError as exc:
+            raise AutomationError(f"{target.name} を実行できませんでした: {exc}") from exc
+
+        if completed.returncode != 0:
+            raise AutomationError(
+                f"{target.name} が失敗しました（終了コード "
+                f"{completed.returncode}）:\n{completed.stderr.strip()[:500]}"
+            )
+        return f"{target.name} を実行しました"
 
     def _do_run_python(self, step: Step) -> str:
         script = self._resolve_path(str(step.params.get("script", "")))
@@ -1168,15 +1595,15 @@ class Runner:
         """
         if self._dry_run:
             return None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self._log_dir / f"{self._scenario.name}_{stamp}_手順{index}.png"
         try:
-            self._log_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = self._log_dir / f"{self._scenario.name}_{stamp}_手順{index}.png"
-            Desktop(backend="uia").capture_as_image().save(path)
-            self._emit("info", f"  失敗時の画面を保存しました: {path}")
-            return path
-        except Exception:  # noqa: BLE001 - 記録に失敗しても実行結果は変えない
+            _capture_screen(path)
+        except OSError:  # 記録に失敗しても実行結果は変えない
             return None
+
+        self._emit("info", f"  失敗時の画面を保存しました: {path}")
+        return path
 
     def _emit(self, kind: str, text: str) -> None:
         self._on_event(kind, text)

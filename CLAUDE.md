@@ -64,7 +64,7 @@ apps/
 | `webcam` | `python apps/webcam/main.py` | Web カメラの映像表示と静止画保存 |
 | `webpin` | `python apps/webpin/main.py` | ESP32 のピン情報を WebSocket で受信し、グラフ表示と CSV ロギング |
 | `esp32cam` | `python apps/esp32cam/main.py` | ESP32-CAM 6 台の MJPEG 映像同時表示、撮影指示、SD カード内の写真閲覧（**参照実装**） |
-| `win_rpa` | `python apps/win_rpa/main.py` | Windows アプリを自動操作して CSV を出力させ、フォルダ分けして結合する（月次ルーティン向け。`--run` で無人実行） |
+| `win_rpa` | `python apps/win_rpa/main.py` | Windows アプリを自動操作して CSV を出力させ、フォルダ分けして結合する。作業のまとまりを「シナリオ」として保存し、選んで 1 本ずつ実行できる（`--run <シナリオ名>` で画面なし実行。月次の自動実行はタスクスケジューラに登録する使い方の 1 つ） |
 
 - アプリフォルダ名は英小文字とアンダースコアのみ（`python -m` でも扱えるようにするため）。
 - **アプリ間で直接 import しない。** `apps/memo` から `apps/viewer` を参照しない。共有したくなったコードは `common/` に切り出す。
@@ -219,6 +219,8 @@ python tools/build.py webcam --onedir     # OpenCV を使うアプリはこち�
 - アプリ内相対 import を解決するため `--paths apps/<アプリ名>` が必要。`tools/build.py` が自動で渡す。
 - OpenCV を使うアプリ（`webcam` / `esp32cam`）は `--onefile` だと起動のたびに展開が走って数秒かかる。`--onedir` を使う。
 - アプリの動作確認はビルド前に `python apps/<アプリ名>/main.py` で済ませる。exe を作る意味があるのは配布形態の検証だけ。
+- **PyInstaller は「import 文がある」だけで丸ごと拾う。** 実行時に一度も通らないものが入って配布物が膨らむ（win_rpa は 64 MB のうち 26.7 MB が numpy だった）。使っていないと確かめられたものは `tools/build.py` の `_EXCLUDES` で `--exclude-module` する。**外す前に本当に呼ばれないか確かめること**（無駄に見えても、`win32ui` は `pywinauto` が先頭で import している）。
+- **配布フォルダはそのまま運ばず zip にする。** `--onedir` は tcl のスクリプトだけで 830 ファイルあり、小さいファイルの大量コピーは同じ容量の 1 ファイルより桁で遅い。
 - 既定はコンソールなし。**exe が起動しない場合のみ `--console` で作り直す。** モジュールの同梱漏れやパス崩れは Python 実行では再現せず exe 起動時にしか出ないため、そのときだけ例外を読む必要がある。
 - ビルド先の exe が実行中だと Windows が上書きを拒否する。`tools/build.py` が検出して PID を表示するので、ウィンドウを閉じてから再実行する。`--onefile` の exe は親子 2 プロセス構成のため、強制終了ではなくウィンドウの「×」で閉じること（親だけ落とすと子が残ってロックし続ける）。
 - **`Path(__file__)` 起点のデータパスは exe 化すると壊れる。** `--onefile` は一時フォルダへ自己展開するので、設定やログの保存先がそこになり終了時に消える。実行ファイル化するアプリは `getattr(sys, "frozen", False)` で分岐し、`sys.executable` 起点に切り替える。

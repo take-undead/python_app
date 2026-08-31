@@ -116,6 +116,17 @@ def list_window_titles(exclude_pid: int | None = None) -> list[str]:
     return sorted(titles)
 
 
+def foreground_window() -> int | None:
+    """いま手前にあるウィンドウの HWND。無ければ None。"""
+    hwnd = _user32.GetForegroundWindow()
+    return int(hwnd) if hwnd else None
+
+
+def process_of(hwnd: int) -> int:
+    """ウィンドウを持っているプロセスの ID。"""
+    return _process_id(hwnd)
+
+
 def spec(hwnd: int) -> WindowSpecification:
     """HWND から pywinauto のウィンドウ指定を作る。
 
@@ -157,3 +168,23 @@ def find_window(
 def find_dialog(title: str, pid: int | None = None) -> WindowSpecification | None:
     """共通ダイアログ（クラス #32770）を題名で探す。"""
     return find_window(title, pid, dialog_only=True)
+
+
+def find_any_dialog(
+    pid: int | None = None, exclude_pid: int | None = None
+) -> WindowSpecification | None:
+    """題名を問わず、いま出ている共通ダイアログを 1 つ返す。
+
+    「よろしいですか？」の類は題名がアプリごとにまちまちで、
+    人に打たせると 1 文字違いで永久に見つからない手順ができる。
+    題名を指定しない場合の受け皿として使う。
+    """
+    for scope in ([pid] if pid is not None else []) + [None]:
+        for handle in find_windows(class_name=DIALOG_CLASS, pid=scope):
+            if exclude_pid is not None and _process_id(handle) == exclude_pid:
+                continue
+            try:
+                return spec(handle)
+            except OSError:
+                continue
+    return None

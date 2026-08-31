@@ -12,19 +12,26 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
+from datetime import date
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Any, Callable, Protocol
 
 from logic import winfind
 from logic.actions import (
+    DATE_RANGE_LABELS,
+    DATE_RANGES,
     FILE_NAME_PATTERNS,
     FILE_PATTERNS,
     FOLDER_PATTERNS,
+    KEY_CHOICES,
+    KEY_LABELS,
     VARIABLE_LABELS,
     WAIT_KINDS,
     Field,
+    clamp_day,
     expand,
+    resolve_date_range,
 )
 from logic.picker import ElementRef, describe as describe_element
 
@@ -181,6 +188,182 @@ class ChoiceEditor(FieldEditor):
         self._var.set("" if value is None else str(value))
 
 
+class KeysEditor(FieldEditor):
+    """押すキー。一覧から選ばせる。
+
+    {ENTER} や ^s という書き方を人に打たせない。画面には「Enter（決定）」の
+    ように出し、保存されるのは pywinauto に渡す値のほう。
+    """
+
+    def _build(self) -> None:
+        self._value = str(self.field.default or "{ENTER}")
+        self._var = tk.StringVar(value=KEY_LABELS.get(self._value, self._value))
+
+        self._combo = ttk.Combobox(
+            self,
+            textvariable=self._var,
+            values=[label for _, label in KEY_CHOICES],
+            state="readonly",
+            width=26,
+        )
+        self._combo.grid(row=0, column=0, sticky="w")
+
+    def get(self) -> Any:
+        label = self._var.get()
+        for value, text in KEY_CHOICES:
+            if text == label:
+                return value
+        # 一覧に無い値は、読み込んだときのまま返す（手で足した設定を壊さない）
+        return self._value
+
+    def set(self, value: Any) -> None:
+        self._value = str(value or "{ENTER}")
+        self._var.set(KEY_LABELS.get(self._value, self._value))
+
+
+class DateRangeEditor(FieldEditor):
+    """更新日の範囲。「先月」などの型から選ばせる。
+
+    日付を打たせない。月次で使う言い方（先月・今月・今日）を並べ、
+    実際にいつからいつまでになるかをその場に出す。今日動かしたら
+    どの範囲になるかが見えないと、選んだものが合っているか分からない。
+
+    どうしても決まった期間を指定したいときだけ、年・月・日を
+    スピンボックスで選ばせる（ここも打ち込みではない）。
+    """
+
+    def _build(self) -> None:
+        self._kind_var = tk.StringVar(value=DATE_RANGE_LABELS["none"])
+        self._preview_var = tk.StringVar(value="")
+
+        self.columnconfigure(0, weight=1)
+        combo = ttk.Combobox(
+            self,
+            textvariable=self._kind_var,
+            values=[label for _, label in DATE_RANGES],
+            state="readonly",
+            width=26,
+        )
+        combo.grid(row=0, column=0, sticky="w")
+
+        # 日付の欄は「期間を指定する」を選んだときだけ出す。
+        # 入れ物を先に作ってから中身を作る（別の親に grid すると描かれない）
+        self._custom = ttk.Frame(self)
+        self._custom.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self._from = _DayPicker(self._custom, "開始日")
+        self._to = _DayPicker(self._custom, "終了日")
+        self._from.grid(row=0, column=0, sticky="w")
+        self._to.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        ttk.Label(
+            self, textvariable=self._preview_var, foreground="#666666",
+            wraplength=420,
+        ).grid(row=2, column=0, sticky="w", pady=(2, 0))
+
+        self._kind_var.trace_add("write", lambda *_: self._refresh())
+        self._from.on_changed = self._refresh
+        self._to.on_changed = self._refresh
+        self._refresh()
+
+    def _kind(self) -> str:
+        label = self._kind_var.get()
+        for value, text in DATE_RANGES:
+            if text == label:
+                return value
+        return "none"
+
+    def _refresh(self) -> None:
+        kind = self._kind()
+        if kind == "custom":
+            self._custom.grid()
+        else:
+            self._custom.grid_remove()
+
+        if kind == "none":
+            self._preview_var.set("（すべてのファイルが対象）")
+            return
+
+        start, end = resolve_date_range(self.get())
+        if start is None or end is None:
+            self._preview_var.set("（すべてのファイルが対象）")
+            return
+
+        when = "今日動かすと " if kind not in ("custom",) else ""
+        self._preview_var.set(
+            f"→ {when}{start:%Y-%m-%d} 〜 {end:%Y-%m-%d} に"
+            "更新されたファイルだけが対象になります"
+        )
+
+    def get(self) -> Any:
+        kind = self._kind()
+        if kind == "none":
+            return {"kind": "none"}
+        if kind != "custom":
+            return {"kind": kind}
+        return {
+            "kind": "custom",
+            "from": self._from.get().isoformat(),
+            "to": self._to.get().isoformat(),
+        }
+
+    def set(self, value: Any) -> None:
+        data = dict(value or {})
+        kind = str(data.get("kind", "none"))
+        self._kind_var.set(DATE_RANGE_LABELS.get(kind, DATE_RANGE_LABELS["none"]))
+        if kind == "custom":
+            self._from.set(data.get("from"))
+            self._to.set(data.get("to"))
+        self._refresh()
+
+
+class _DayPicker(ttk.Frame):
+    """年・月・日をスピンボックスで選ばせる小さな部品。"""
+
+    def __init__(self, master: tk.Misc, label: str) -> None:
+        super().__init__(master)
+        self.on_changed: Callable[[], None] = lambda: None
+
+        today = date.today()
+        self._year = tk.StringVar(value=str(today.year))
+        self._month = tk.StringVar(value=str(today.month))
+        self._day = tk.StringVar(value="1")
+
+        ttk.Label(self, text=label, width=7).grid(row=0, column=0, sticky="w")
+        for column, (var, to, unit) in enumerate(
+            ((self._year, 2100, "年"), (self._month, 12, "月"), (self._day, 31, "日")),
+            start=1,
+        ):
+            ttk.Spinbox(
+                self, from_=1 if unit != "年" else 2000, to=to,
+                textvariable=var, width=6 if unit == "年" else 4,
+                command=lambda: self.on_changed(),
+            ).grid(row=0, column=column * 2 - 1, sticky="w", padx=(4, 0))
+            ttk.Label(self, text=unit).grid(row=0, column=column * 2, sticky="w")
+            var.trace_add("write", lambda *_: self.on_changed())
+
+    def get(self) -> date:
+        def number(var: tk.StringVar, fallback: int) -> int:
+            try:
+                return int(var.get())
+            except ValueError:
+                return fallback
+
+        return clamp_day(
+            number(self._year, date.today().year),
+            number(self._month, date.today().month),
+            number(self._day, 1),
+        )
+
+    def set(self, value: Any) -> None:
+        try:
+            day = date.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return
+        self._year.set(str(day.year))
+        self._month.set(str(day.month))
+        self._day.set(str(day.day))
+
+
 class PathEditor(FieldEditor):
     """既にあるファイルを選ぶ。"""
 
@@ -193,8 +376,9 @@ class PathEditor(FieldEditor):
         ttk.Button(self, text="参照...", command=self._browse, width=8).grid(
             row=0, column=1, padx=(4, 0)
         )
-        if self.save_mode:
-            _attach_variable_menu(self, entry).grid(row=0, column=2, padx=(4, 0))
+        # 開くファイルにも {yyyymm} を使う（前月分を読み込ませる）ため、
+        # 保存先かどうかに関わらず差し込みを出す
+        _attach_variable_menu(self, entry).grid(row=0, column=2, padx=(4, 0))
 
     def _browse(self) -> None:
         initial = self.context.work_dir()
@@ -625,6 +809,8 @@ _EDITORS: dict[str, type[FieldEditor]] = {
     "int": IntEditor,
     "bool": BoolEditor,
     "choice": ChoiceEditor,
+    "keys": KeysEditor,
+    "date_range": DateRangeEditor,
     "path": PathEditor,
     "save_path": SavePathEditor,
     "folder": FolderEditor,

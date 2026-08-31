@@ -38,6 +38,27 @@ _HIDDEN_IMPORTS: dict[str, tuple[str, ...]] = {
     "win_rpa": ("win32timezone",),
 }
 
+# 同梱しなくてよいモジュール。
+# PyInstaller は「import 文がある」だけで丸ごと拾うため、実行時に一度も
+# 通らない経路のものが入る。配布フォルダを対象 PC にコピーする時間に
+# 直接効くので、使っていないと確かめられたものはここで外す。
+#
+# **外す前に、必ず本当に呼ばれないか確かめること。** 例えば `win32ui`
+# （pythonwin、1.1 MB）は `pywinauto.base_wrapper` が先頭で import して
+# いるので外せない。
+_EXCLUDES: dict[str, tuple[str, ...]] = {
+    "win_rpa": (
+        # comtypes の numpy 連携（COM の SAFEARRAY を ndarray で受け渡す）。
+        # comtypes.npsupport.enable_numpy_interop() を呼んだときだけ動くもので、
+        # pywinauto は呼ばない。これだけで 26.7 MB
+        "numpy",
+        # Pillow の AVIF 対応（_avif.pyd が 7.5 MB）。保存するのは PNG だけ。
+        # 画像プラグインの読み込みは PIL 側が ImportError を握るので、
+        # 外しても他の形式に影響しない
+        "PIL.AvifImagePlugin",
+    ),
+}
+
 
 def available_apps() -> list[str]:
     """main.py を持つアプリ名の一覧を返す。"""
@@ -151,6 +172,8 @@ def build(app: str, onedir: bool = False, console: bool = False) -> Path:
     ]
     for module in _HIDDEN_IMPORTS.get(app, ()):
         command += ["--hidden-import", module]
+    for module in _EXCLUDES.get(app, ()):
+        command += ["--exclude-module", module]
     # 既定は --windowed。バンドル漏れによる起動失敗を調べるときだけコンソールを出す
     command.append("--console" if console else "--windowed")
     command.append(str(entry))

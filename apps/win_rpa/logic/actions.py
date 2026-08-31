@@ -10,8 +10,9 @@
 from __future__ import annotations
 
 import uuid
+from calendar import monthrange
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,8 @@ class Field:
         int          数値
         bool         チェックボックス
         choice       ドロップダウン
+        keys         キーボードのキー（一覧から選ぶ）
+        date_range   更新日の範囲（先月・今月などの型から選ぶ）
         path         既存のファイル・フォルダを選ぶ
         save_path    保存先を指定する
         folder       フォルダ（参照で選ぶか、年月日などの型から組み立てる）
@@ -89,6 +92,16 @@ _TIMEOUT_FIELD = Field(
     help="この秒数を過ぎても合図が来なければエラーにする",
 )
 
+# 押し方。左クリックだけでは足りない場面（一覧の項目を開く、右クリック
+# メニューを出す）が業務アプリでは普通にあるため、選べるようにしておく
+CLICK_MANNERS: tuple[str, ...] = ("左クリック", "ダブルクリック", "右クリック")
+
+# ダイアログのボタン。日本語 Windows でもボタン名が英語のままのものが
+# あるので、ここでは押したい意味だけを選ばせ、実際の照合は runner が行う
+DIALOG_BUTTONS: tuple[str, ...] = (
+    "OK", "はい", "いいえ", "キャンセル", "保存", "開く", "閉じる",
+)
+
 
 ACTIONS: dict[str, ActionSpec] = {
     "launch_app": ActionSpec(
@@ -106,6 +119,8 @@ ACTIONS: dict[str, ActionSpec] = {
         "ボタンを押す",
         (
             Field("target", "element", "対象", required=True),
+            Field("manner", "choice", "押し方", choices=CLICK_MANNERS,
+                  default=CLICK_MANNERS[0]),
             _WAIT_FIELD,
             _TIMEOUT_FIELD,
         ),
@@ -144,6 +159,58 @@ ACTIONS: dict[str, ActionSpec] = {
         ),
         category=CAT_APP,
     ),
+    "send_keys": ActionSpec(
+        "send_keys",
+        "キーを押す",
+        (
+            Field("target", "element", "対象",
+                  help="指定しなければ、いま入力を受けている場所に送る"),
+            Field("keys", "keys", "押すキー", required=True, default="{ENTER}"),
+            Field("repeat", "int", "回数", default=1),
+            _WAIT_FIELD,
+            _TIMEOUT_FIELD,
+        ),
+        help="ボタンが無い操作（Enter で確定、Tab で次の欄、Ctrl+S で保存）を行う",
+        category=CAT_APP,
+    ),
+    "menu_select": ActionSpec(
+        "menu_select",
+        "メニューから選ぶ",
+        (
+            Field("path", "text", "たどる順", required=True,
+                  help="「ファイル > エクスポート」のように > で区切る"),
+            _WAIT_FIELD,
+            _TIMEOUT_FIELD,
+        ),
+        help="メニューバーを順にたどって開く。開いてからでないと選べない項目を"
+             "1 手順で扱える",
+        category=CAT_APP,
+    ),
+    "focus_window": ActionSpec(
+        "focus_window",
+        "ウィンドウを前面に出す",
+        (
+            Field("title", "window_title", "ウィンドウの題名", required=True),
+            Field("timeout", "int", "待ち時間（秒）", default=30),
+        ),
+        help="操作する画面を手前に出して、以降の手順の対象をそのウィンドウに移す",
+        category=CAT_APP,
+    ),
+    "dialog_button": ActionSpec(
+        "dialog_button",
+        "メッセージに応じる",
+        (
+            Field("button", "choice", "押すボタン", required=True,
+                  choices=DIALOG_BUTTONS, default="OK"),
+            Field("dialog_title", "window_title", "ダイアログの題名",
+                  help="空なら、出ているメッセージをそのまま対象にする"),
+            Field("optional", "bool", "出ていなければ飛ばす", default=True),
+            Field("timeout", "int", "待ち時間（秒）", default=10),
+        ),
+        help="「よろしいですか？」のような確認に答える。無人実行では"
+             "これが無いと止まったまま朝を迎える",
+        category=CAT_APP,
+    ),
     "save_dialog": ActionSpec(
         "save_dialog",
         "「名前を付けて保存」に応じる",
@@ -158,6 +225,19 @@ ACTIONS: dict[str, ActionSpec] = {
             Field("timeout", "int", "待ち時間（秒）", default=30),
         ),
         help="対象アプリが出す保存ダイアログにファイル名を入れて保存する",
+        category=CAT_FILE,
+    ),
+    "open_dialog": ActionSpec(
+        "open_dialog",
+        "「ファイルを開く」に応じる",
+        (
+            Field("path", "path", "開くファイル", required=True),
+            Field(
+                "dialog_title", "window_title", "ダイアログの題名", default="開く",
+            ),
+            Field("timeout", "int", "待ち時間（秒）", default=30),
+        ),
+        help="対象アプリが出す「開く」ダイアログにファイル名を入れて開く",
         category=CAT_FILE,
     ),
     "assert_text": ActionSpec(
@@ -179,6 +259,17 @@ ACTIONS: dict[str, ActionSpec] = {
             Field("timeout", "int", "待ち時間（秒）", default=60),
         ),
         help="空ファイルを黙って次に渡さないための歯止め",
+        category=CAT_CHECK,
+    ),
+    "screenshot": ActionSpec(
+        "screenshot",
+        "画面を保存する",
+        (
+            Field("name", "text", "画像の名前", required=True,
+                  default="画面_{yyyymmdd}.png"),
+        ),
+        help="そのときの画面を保存先フォルダに残す。月に 1 回しか動かさないので、"
+             "「本当にこの内容で出力したか」を後から見られるようにしておく",
         category=CAT_CHECK,
     ),
     "make_folder": ActionSpec(
@@ -211,6 +302,9 @@ ACTIONS: dict[str, ActionSpec] = {
             Field("source", "file_pattern", "対象のファイル", required=True),
             Field("from_dir", "folder", "探す場所"),
             Field("dest", "folder", "行き先のフォルダ", required=True),
+            Field("modified", "date_range", "更新日で絞る",
+                  help="ファイル名に日付が入っていないときに使う。"
+                       "ファイルの更新日時で選ぶ"),
             Field("mode", "choice", "やり方", choices=("コピー", "移動"),
                   default="コピー"),
             Field("rename", "text", "名前を付け替える",
@@ -246,6 +340,23 @@ ACTIONS: dict[str, ActionSpec] = {
         "アプリを閉じる",
         (Field("timeout", "int", "待ち時間（秒）", default=20),),
         category=CAT_APP,
+    ),
+    "wait_seconds": ActionSpec(
+        "wait_seconds",
+        "しばらく待つ",
+        (Field("seconds", "int", "待つ秒数", required=True, default=5),),
+        help="時間で待つのは最後の手段。合図で待てるなら、各手順の"
+             "「終わった合図」を使うほうが速くて確実",
+    ),
+    "run_program": ActionSpec(
+        "run_program",
+        "別のプログラムを実行する",
+        (
+            Field("app", "app", "実行するプログラム", required=True),
+            Field("wait_exit", "bool", "終わるまで待つ", default=True),
+            Field("timeout", "int", "待ち時間（秒）", default=300),
+        ),
+        help="バッチファイルや別のツールを呼ぶ。終了コードが 0 以外なら失敗にする",
     ),
     "run_python": ActionSpec(
         "run_python",
@@ -323,6 +434,188 @@ FILE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("*{yyyymm}*.csv", "今月分の CSV（名前に 202608 を含む）"),
     ("*{prev_yyyymm}*.csv", "前月分の CSV（名前に 202607 を含む）"),
 )
+
+
+# 押せるキー。左が保存される値（pywinauto の書き方）、右が画面に出す説明。
+# {ENTER} や ^s という書き方をユーザーに覚えさせないための一覧
+KEY_CHOICES: tuple[tuple[str, str], ...] = (
+    ("{ENTER}", "Enter（決定）"),
+    ("{TAB}", "Tab（次の項目へ）"),
+    ("{ESC}", "Esc（取り消し）"),
+    ("{SPACE}", "スペース"),
+    ("{BACKSPACE}", "BackSpace（1 文字消す）"),
+    ("{DELETE}", "Delete（1 文字消す）"),
+    ("{UP}", "↑"),
+    ("{DOWN}", "↓"),
+    ("{LEFT}", "←"),
+    ("{RIGHT}", "→"),
+    ("{HOME}", "Home（先頭へ）"),
+    ("{END}", "End（末尾へ）"),
+    ("{PGUP}", "PageUp（前の画面）"),
+    ("{PGDN}", "PageDown（次の画面）"),
+    ("^a", "Ctrl+A（すべて選択）"),
+    ("^c", "Ctrl+C（コピー）"),
+    ("^v", "Ctrl+V（貼り付け）"),
+    ("^x", "Ctrl+X（切り取り）"),
+    ("^z", "Ctrl+Z（元に戻す）"),
+    ("^n", "Ctrl+N（新規）"),
+    ("^o", "Ctrl+O（開く）"),
+    ("^s", "Ctrl+S（保存）"),
+    ("^p", "Ctrl+P（印刷）"),
+    ("^f", "Ctrl+F（検索）"),
+    ("{F1}", "F1"),
+    ("{F2}", "F2"),
+    ("{F3}", "F3"),
+    ("{F4}", "F4"),
+    ("{F5}", "F5（更新）"),
+    ("{F6}", "F6"),
+    ("{F7}", "F7"),
+    ("{F8}", "F8"),
+    ("{F9}", "F9"),
+    ("{F10}", "F10"),
+    ("{F11}", "F11"),
+    ("{F12}", "F12"),
+    ("%{F4}", "Alt+F4（閉じる）"),
+)
+
+KEY_LABELS: dict[str, str] = {value: label for value, label in KEY_CHOICES}
+
+
+def describe_keys(value: str) -> str:
+    """キーの値を、画面と実行ログに出す言い方にする。"""
+    return KEY_LABELS.get(value, value)
+
+
+# メニューをたどる順の区切り。どれで書いても同じに扱う
+_MENU_SEPARATORS: tuple[str, ...] = ("->", "→", "＞", ">", "／", "/")
+
+
+def menu_parts(path: str) -> list[str]:
+    """「ファイル > エクスポート」を ["ファイル", "エクスポート"] にする。
+
+    区切りの書き方は人によって違うので、受け取る側で吸収する。
+    """
+    text = path
+    for separator in _MENU_SEPARATORS:
+        text = text.replace(separator, "\n")
+    return [part.strip() for part in text.split("\n") if part.strip()]
+
+
+# 更新日の範囲。日付を打たせず、月次で使う言い方から選ばせる。
+# 左が保存される値、右が画面に出す説明
+DATE_RANGES: tuple[tuple[str, str], ...] = (
+    ("none", "指定なし（すべて）"),
+    ("prev_month", "先月（1 日〜末日）"),
+    ("this_month", "今月（1 日〜今日）"),
+    ("today", "今日"),
+    ("yesterday", "昨日"),
+    ("last_7", "直近 7 日"),
+    ("last_30", "直近 30 日"),
+    ("custom", "期間を指定する"),
+)
+
+DATE_RANGE_LABELS: dict[str, str] = {value: label for value, label in DATE_RANGES}
+
+
+def _month_start(when: date) -> date:
+    return when.replace(day=1)
+
+
+def _prev_month_start(when: date) -> date:
+    return (
+        when.replace(year=when.year - 1, month=12, day=1)
+        if when.month == 1
+        else when.replace(month=when.month - 1, day=1)
+    )
+
+
+def clamp_day(year: int, month: int, day: int) -> date:
+    """年・月・日から日付を作る。その月に無い日は末日に丸める。
+
+    日を選ぶ欄は 1〜31 を出すので、2 月 31 日のような組み合わせが来る。
+    エラーにせず末日として扱う（「月末まで」を選びたい人の意図に合う）。
+    """
+    year = max(1, min(9999, year))
+    month = max(1, min(12, month))
+    last = monthrange(year, month)[1]
+    return date(year, month, max(1, min(last, day)))
+
+
+def resolve_date_range(
+    value: Any, today: date | None = None
+) -> tuple[datetime | None, datetime | None]:
+    """更新日の範囲を、実際の日時（開始・終了）に直す。
+
+    どちらも含む。終了はその日の 23:59:59.999999 まで。
+    指定なしのときは (None, None) を返す。
+    """
+    data = dict(value or {})
+    kind = str(data.get("kind", "none"))
+    today = today or date.today()
+
+    if kind in ("", "none"):
+        return None, None
+
+    if kind == "custom":
+        start_day = _parse_day(data.get("from")) or date.min
+        end_day = _parse_day(data.get("to")) or date.max
+    elif kind == "today":
+        start_day = end_day = today
+    elif kind == "yesterday":
+        start_day = end_day = today - timedelta(days=1)
+    elif kind == "this_month":
+        start_day, end_day = _month_start(today), today
+    elif kind == "prev_month":
+        start_day = _prev_month_start(today)
+        end_day = _month_start(today) - timedelta(days=1)
+    elif kind == "last_7":
+        start_day, end_day = today - timedelta(days=6), today
+    elif kind == "last_30":
+        start_day, end_day = today - timedelta(days=29), today
+    else:
+        return None, None
+
+    if start_day > end_day:
+        start_day, end_day = end_day, start_day
+
+    return (
+        datetime.combine(start_day, time.min),
+        datetime.combine(end_day, time.max),
+    )
+
+
+def _parse_day(raw: Any) -> date | None:
+    """保存されている "2026-08-01" を日付に直す。読めなければ None。"""
+    try:
+        return date.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def describe_date_range(value: Any, today: date | None = None) -> str:
+    """更新日の範囲を、手順一覧と実行ログに出す言い方にする。"""
+    data = dict(value or {})
+    kind = str(data.get("kind", "none"))
+    if kind in ("", "none"):
+        return ""
+
+    if kind != "custom":
+        return DATE_RANGE_LABELS.get(kind, kind)
+
+    # 片側だけの指定も、そのまま「いつから」「いつまで」として読ませる。
+    # 手で JSON を直したときに片方が欠けることがあり、そこで
+    # 0001-01-01 のような日付を見せても何も伝わらない
+    start = _parse_day(data.get("from"))
+    end = _parse_day(data.get("to"))
+    if start and end:
+        if start > end:
+            start, end = end, start
+        return f"{start:%Y-%m-%d} 〜 {end:%Y-%m-%d}"
+    if start:
+        return f"{start:%Y-%m-%d} から"
+    if end:
+        return f"{end:%Y-%m-%d} まで"
+    return "期間を指定する"
 
 
 # 完了条件の種類
@@ -437,6 +730,11 @@ class Step:
             ref = self.element()
             what = describe_element(ref) if ref else "(対象未指定)"
             if self.action == "click":
+                manner = str(self.params.get("manner", CLICK_MANNERS[0]))
+                if manner == "ダブルクリック":
+                    return f"{what} をダブルクリックする"
+                if manner == "右クリック":
+                    return f"{what} を右クリックする"
                 return f"{what} を押す"
             if self.action == "check":
                 on = self.params.get("value", True)
@@ -446,8 +744,33 @@ class Step:
             if self.action == "set_text":
                 return f"{what} に「{self.params.get('value', '')}」を入力する"
             return f"{what} に「{self.params.get('contains', '')}」が出るか確認する"
+        if self.action == "send_keys":
+            keys = describe_keys(str(self.params.get("keys", "")))
+            count = int(self.params.get("repeat", 1) or 1)
+            ref = self.element()
+            where = f"{describe_element(ref)} で " if ref else ""
+            times = f" を {count} 回" if count > 1 else " を"
+            return f"{where}{keys}{times}押す"
+        if self.action == "menu_select":
+            parts = menu_parts(str(self.params.get("path", "")))
+            return f"メニュー「{' > '.join(parts)}」を選ぶ" if parts else "メニューを選ぶ"
+        if self.action == "focus_window":
+            return f"「{self.params.get('title', '')}」を前面に出す"
+        if self.action == "dialog_button":
+            title = str(self.params.get("dialog_title", "")).strip()
+            where = f"「{title}」で" if title else "出ているメッセージで"
+            return f"{where}「{self.params.get('button', '')}」を押す"
         if self.action == "save_dialog":
             return f"保存ダイアログに「{Path(self.params.get('path', '')).name}」で保存する"
+        if self.action == "open_dialog":
+            return f"開くダイアログで「{Path(self.params.get('path', '')).name}」を開く"
+        if self.action == "screenshot":
+            return f"画面を「{self.params.get('name', '')}」に残す"
+        if self.action == "wait_seconds":
+            return f"{self.params.get('seconds', 0)} 秒待つ"
+        if self.action == "run_program":
+            app = self.params.get("app") or {}
+            return f"{app.get('name', '(未指定)')} を実行する"
         if self.action == "assert_file":
             return f"「{Path(self.params.get('path', '')).name}」ができたか確認する"
         if self.action == "merge_csv":
@@ -461,8 +784,10 @@ class Step:
             return f"保存先を「{self.params.get('path', '')}」にする"
         if self.action == "copy_files":
             verb = "移動" if self.params.get("mode") == "移動" else "コピー"
+            when = describe_date_range(self.params.get("modified"))
+            narrowed = f"（更新日: {when}）" if when else ""
             return (
-                f"{self.params.get('source', '')} を"
+                f"{self.params.get('source', '')}{narrowed} を"
                 f"「{self.params.get('dest', '')}」へ{verb}する"
             )
         if self.action == "run_python":
