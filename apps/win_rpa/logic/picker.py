@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
+from pywinauto.controls.uiawrapper import UIAWrapper
 from pywinauto.uia_defines import IUIA
 from pywinauto.uia_element_info import UIAElementInfo
 
@@ -36,9 +37,13 @@ class PickerError(Exception):
 class ElementRef:
     """照合に使う要素の識別情報。
 
-    照合は auto_id → name + control_type → index_path の順に試す。
+    照合は auto_id → name → help_text → legacy_name → index_path の順に試す。
     class_name は記録するが照合には使わない（WinForms のクラス名は
     実行ごとに変わるハッシュを含むため）。
+
+    help_text と legacy_name は、**アイコンだけのツールバーボタン**のために
+    ある。UIA の Name が空でも、ツールチップや古い形式（MSAA）の名前は
+    入っていることが多い。ここが取れれば、位置で探さずに済む。
     """
 
     auto_id: str
@@ -50,6 +55,10 @@ class ElementRef:
     window_auto_id: str
     # ウィンドウ直下から対象までの (control_type, 同種の中での位置) の並び
     index_path: tuple[tuple[str, int], ...] = field(default=())
+    # ツールチップ（UIA の HelpText）
+    help_text: str = ""
+    # 古い形式（LegacyIAccessible）の名前
+    legacy_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -58,7 +67,10 @@ class ElementRef:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ElementRef":
-        raw = dict(data)
+        # 知らないキーは捨てる。項目を増やす前に保存されたシナリオと、
+        # 逆に新しい項目を持つシナリオを古いコードで開いた場合の両方で落ちない
+        known = {f.name for f in fields(cls)}
+        raw = {key: value for key, value in data.items() if key in known}
         raw["index_path"] = tuple(
             (str(step[0]), int(step[1])) for step in raw.get("index_path", ())
         )
@@ -105,7 +117,32 @@ def capture_at(x: int, y: int) -> ElementRef:
         window_title=_safe(window.name),
         window_auto_id=_safe(window.automation_id),
         index_path=_index_path(chain),
+        help_text=help_text_of(info),
+        legacy_name=legacy_name_of(info),
     )
+
+
+def help_text_of(info: UIAElementInfo) -> str:
+    """ツールチップ（UIA の HelpText）を読む。
+
+    アイコンだけのボタンは Name が空でもここに説明が入っていることが多い。
+    """
+    try:
+        return _safe(info.element.CurrentHelpText)
+    except Exception:  # noqa: BLE001 - COM は種類が定まらない
+        return ""
+
+
+def legacy_name_of(info: UIAElementInfo) -> str:
+    """古い形式（LegacyIAccessible / MSAA）の名前を読む。
+
+    Win32 や MFC のツールバーは、UIA の Name を出さずにこちらだけ持つ
+    ことがある。
+    """
+    try:
+        return _safe(UIAWrapper(info).legacy_properties().get("Name"))
+    except Exception:  # noqa: BLE001 - パターン未対応の要素では失敗する
+        return ""
 
 
 def capture_at_cursor() -> ElementRef:
@@ -133,7 +170,13 @@ def peek_at_cursor() -> str:
     if name:
         return f"{label}「{name}」"
     auto_id = _safe(info.automation_id)
-    return f"{label}（{auto_id}）" if auto_id else f"名前のない{label}"
+    if auto_id:
+        return f"{label}（{auto_id}）"
+    # 名前が無くてもツールチップがあれば、狙いが合っているかは分かる
+    hint = help_text_of(info) or legacy_name_of(info)
+    if hint:
+        return f"{label}〔{hint}〕"
+    return f"名前のない{label}"
 
 
 # ----------------------------------------------------------------------
@@ -190,16 +233,31 @@ def describe(ref: ElementRef) -> str:
         return f"{label}「{ref.name}」"
     if ref.auto_id:
         return f"{label}（{ref.auto_id}）"
+    hint = ref.help_text or ref.legacy_name
+    if hint:
+        return f"{label}〔{hint}〕"
+    if ref.index_path:
+        # 名前のないボタンが並ぶと一覧で見分けが付かないので位置を出す
+        return f"名前のない{label}（{ref.index_path[-1][1] + 1} 個目）"
     return f"名前のない{label}"
 
 
 def is_identifiable(ref: ElementRef) -> bool:
-    """名前も AutomationId も無い＝安定して見つけられない要素かを判定する。
+    """名前で確実に見つけられる要素かを判定する。
 
-    Tkinter 製アプリのように UIA へ何も公開しないものは、ここで弾いて
-    ユーザーに早く伝える（座標頼みの手順を作らせないため）。
+    AutomationId・名前のほか、ツールチップと古い形式の名前も見る。
+    アイコンだけのツールバーボタンは、これらだけを持っていることがある。
     """
-    return bool(ref.auto_id or ref.name)
+    return bool(ref.auto_id or ref.name or ref.help_text or ref.legacy_name)
+
+
+def is_positional_only(ref: ElementRef) -> bool:
+    """名前の類が一切なく、構造上の位置でしか探せない要素かを判定する。
+
+    探せないわけではない（実行側の 3 段目が使える）が、対象アプリの更新で
+    ボタンが増減すると隣を押すことになる。使う前に人に確認する。
+    """
+    return not is_identifiable(ref) and bool(ref.index_path)
 
 
 # ----------------------------------------------------------------------

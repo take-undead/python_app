@@ -29,6 +29,15 @@ BUILD_DIR = ROOT / "build"
 # OpenCV を使うアプリは --onefile だと展開に数秒かかるため警告する
 _HEAVY_APPS = ("webcam", "esp32cam")
 
+# PyInstaller の解析では見つからない import。
+# 遅延 import されるモジュールは import 文としてコードに現れないので同梱漏れになり、
+# **exe を動かしたときにしか再現しない**。気づいた時点でここに足す。
+_HIDDEN_IMPORTS: dict[str, tuple[str, ...]] = {
+    # pywin32 が COM の日時（FILETIME）を変換するときに遅延 import する。
+    # win_rpa ではショートカットの解決（IShellLink）で踏む
+    "win_rpa": ("win32timezone",),
+}
+
 
 def available_apps() -> list[str]:
     """main.py を持つアプリ名の一覧を返す。"""
@@ -140,6 +149,8 @@ def build(app: str, onedir: bool = False, console: bool = False) -> Path:
         str(BUILD_DIR / "spec"),
         "--onedir" if onedir else "--onefile",
     ]
+    for module in _HIDDEN_IMPORTS.get(app, ()):
+        command += ["--hidden-import", module]
     # 既定は --windowed。バンドル漏れによる起動失敗を調べるときだけコンソールを出す
     command.append("--console" if console else "--windowed")
     command.append(str(entry))

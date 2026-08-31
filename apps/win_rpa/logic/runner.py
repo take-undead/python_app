@@ -23,7 +23,7 @@ from pywinauto import Application, Desktop
 from pywinauto.controls.uiawrapper import UIAWrapper
 from pywinauto.uia_element_info import UIAElementInfo
 
-from logic import merger, winfind
+from logic import appinfo, launch, merger, picker, winfind
 from logic.actions import (
     Scenario,
     Step,
@@ -39,6 +39,8 @@ _POLL_SEC = 0.4
 # 照合に使った手段。上ほど信頼できる
 MATCH_AUTO_ID = "AutomationId"
 MATCH_NAME = "名前"
+MATCH_HELP = "ツールチップ"
+MATCH_LEGACY = "古い形式の名前"
 MATCH_PATH = "構造上の位置"
 
 # Windows がフォルダ名に許さない文字（\ と / は階層の区切りとして通す）
@@ -118,32 +120,58 @@ class Runner:
         """実行中の手順が終わり次第、止める。"""
         self._cancelled = True
 
-    def run(self, upto: int | None = None) -> RunReport:
+    def run(self, upto: int | None = None, only: int | None = None) -> RunReport:
         """手順を順に実行する。
 
-        upto を指定すると、そこまでで止める（「ここまで試し実行」用）。
+        upto を指定すると、そこまでで止める（「ここまで実行」用）。
+        only を指定すると、その手順 1 つだけを実行する（「この手順だけ実行」用）。
+        **前の手順は動かさない**ので、対象アプリは自分で開いておく必要がある。
+        要素は記録されたウィンドウ題名から探すため、起動済みなら見つかる。
         """
         report = RunReport(dry_run=self._dry_run)
         self._work_dir.mkdir(parents=True, exist_ok=True)
 
-        steps = self._scenario.steps[: upto if upto is not None else None]
+        all_steps = self._scenario.steps
+        if only is not None:
+            if not 1 <= only <= len(all_steps):
+                raise AutomationError(f"手順 {only} は存在しません。")
+            numbered = [(only, all_steps[only - 1])]
+            # 前提の判定には、シナリオ上その手前にある手順を使う。
+            # 実際には動かさないが、「前にフォルダを作る手順があるか」は
+            # シナリオの形の話なので、1 つだけ動かすときも同じ基準にする
+            preceding = list(all_steps[: only - 1])
+        else:
+            numbered = list(
+                enumerate(all_steps[: upto if upto is not None else None], start=1)
+            )
+            preceding = []
+
         mode = "確認実行" if self._dry_run else "実行"
-        self._emit("info", f"{mode}を開始します（{len(steps)} 手順）")
+        # 版を先に出す。対象 PC にコピーして動かすため、ログだけ見て
+        # 「いつのコードか」が分からないと調査できない
+        self._emit("info", appinfo.log_line())
+        if only is not None:
+            self._emit(
+                "info",
+                f"{mode}: 手順 {only} だけを動かします"
+                "（前の手順は動かしません。対象アプリは開いておくこと）",
+            )
+        else:
+            self._emit("info", f"{mode}を開始します（{len(numbered)} 手順）")
 
         # 前提の欠けは対象アプリを起動する前に出す。
         # 8 手順進んでから「先にフォルダを作る手順が要る」と言われても遅い
-        for index, step in enumerate(steps):
-            problem = requirement_error(step.spec, steps[:index])
+        for position, (index, step) in enumerate(numbered):
+            before = preceding + [item for _, item in numbered[:position]]
+            problem = requirement_error(step.spec, before)
             if not problem:
                 continue
-            message = f"{problem}（手順 {index + 1}: {step.spec.label}）"
+            message = f"{problem}（手順 {index}: {step.spec.label}）"
             self._emit("error", message)
-            report.results.append(
-                StepResult(index + 1, step, False, message, 0.0)
-            )
+            report.results.append(StepResult(index, step, False, message, 0.0))
             return report
 
-        for index, step in enumerate(steps, start=1):
+        for index, step in numbered:
             if self._cancelled:
                 self._emit("warn", "中止しました。")
                 break
@@ -227,8 +255,26 @@ class Runner:
                 f"アプリが見つかりません: {target}\n"
                 "この PC では場所が違う可能性があります。選び直してください。"
             )
+
+        # 実行ファイルでなければ、ショートカットや関連付けをたどって実体まで落とす。
+        # CreateProcess はどちらも解決しないので、渡す前に exe にしておく必要がある。
+        # ふだんはアプリを選んだ時点で落ちているが、この対応より前に保存された
+        # シナリオと、固有拡張子のファイルを直接指定した場合のための保険
+        how = "実行ファイル"
+        if target.suffix.lower() not in launch.RUNNABLE_SUFFIXES:
+            try:
+                found = launch.resolve_launch(target)
+            except launch.LaunchError as exc:
+                raise AutomationError(f"起動できません: {exc}") from exc
+            args = f"{found.args} {args}".strip()
+            work_dir = work_dir or (str(found.work_dir) if found.work_dir else None)
+            target = found.exe
+            how = found.how
+
         if self._dry_run:
-            return f"起動できる状態です（{target.name}）"
+            if how == "実行ファイル":
+                return f"起動できる状態です（{target.name}）"
+            return f"起動できる状態です（{how} → {target.name}）"
 
         command = f'"{target}" {args}'.strip()
         try:
@@ -789,6 +835,8 @@ class Runner:
             for finder, how in (
                 (self._find_by_auto_id, MATCH_AUTO_ID),
                 (self._find_by_name, MATCH_NAME),
+                (self._find_by_help_text, MATCH_HELP),
+                (self._find_by_legacy_name, MATCH_LEGACY),
                 (self._find_by_path, MATCH_PATH),
             ):
                 try:
@@ -826,6 +874,34 @@ class Runner:
         spec = window.child_window(title=ref.name, control_type=ref.control_type)
         return spec.wrapper_object() if spec.exists() else None
 
+    def _find_by_help_text(self, window: Any, ref: ElementRef) -> UIAWrapper | None:
+        """ツールチップで探す。アイコンだけのボタン用。"""
+        return self._find_by_property(window, ref, ref.help_text, picker.help_text_of)
+
+    def _find_by_legacy_name(self, window: Any, ref: ElementRef) -> UIAWrapper | None:
+        """古い形式（LegacyIAccessible）の名前で探す。"""
+        return self._find_by_property(
+            window, ref, ref.legacy_name, picker.legacy_name_of
+        )
+
+    def _find_by_property(
+        self,
+        window: Any,
+        ref: ElementRef,
+        wanted: str,
+        read: Callable[[UIAElementInfo], str],
+    ) -> UIAWrapper | None:
+        """child_window で指定できない属性は、自分で見て回る。
+
+        auto_id と名前が外れたときだけ動くので、走査の重さは許容する。
+        """
+        if not wanted:
+            return None
+        for control in window.descendants(control_type=ref.control_type or None):
+            if read(control.element_info) == wanted:
+                return control
+        return None
+
     def _find_by_path(self, window: Any, ref: ElementRef) -> UIAWrapper | None:
         """AutomationId も名前も変わったときの最後の手段。
 
@@ -848,6 +924,15 @@ class Runner:
         return UIAWrapper(info)
 
     def _warn_if_fallback(self, ref: ElementRef, how: str) -> None:
+        # 位置での照合は、名前が無いので初めからそう決めた場合でも毎回知らせる。
+        # ボタンが増減すると黙って隣を押すため、ログに残っていないと後で追えない
+        if how == MATCH_PATH:
+            self._emit(
+                "warn",
+                f"  {describe_element(ref)} を構造上の位置で見つけました。"
+                "ボタンの増減があると別のものを操作します。",
+            )
+            return
         if how == MATCH_AUTO_ID or not ref.auto_id:
             return
         self._emit(

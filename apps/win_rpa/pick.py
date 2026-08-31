@@ -52,12 +52,15 @@ def _report(ref: ElementRef, index: int) -> None:
     print(f"    ウィンドウ     : {ref.window_title or '(名前なし)'}")
     print(f"    AutomationId   : {ref.auto_id or '(なし)'}")
     print(f"    名前           : {ref.name or '(なし)'}")
+    print(f"    ツールチップ   : {ref.help_text or '(なし)'}")
+    print(f"    古い形式の名前 : {ref.legacy_name or '(なし)'}")
     print(f"    種類           : {ref.control_type}")
     print(f"    フレームワーク : {ref.framework or '(不明)'}")
     print(f"    構造上の位置   : {' > '.join(f'{t}[{i}]' for t, i in ref.index_path)}")
 
     if not is_identifiable(ref):
-        print("    ⚠ 名前も AutomationId もありません。")
+        print("    ⚠ 名前になるものが 1 つもありません。")
+        print("      構造上の位置でしか探せません（ボタンが増減すると外れます）。")
         print("      このアプリは UIA に情報を公開していない可能性があります。")
 
 

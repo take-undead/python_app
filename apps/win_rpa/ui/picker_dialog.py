@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Callable
 
 from logic.picker import (
@@ -22,6 +22,7 @@ from logic.picker import (
     describe,
     is_identifiable,
     is_key_pressed,
+    is_positional_only,
     peek_at_cursor,
 )
 
@@ -115,16 +116,37 @@ class PickerDialog(tk.Toplevel):
             return
 
         if not is_identifiable(ref):
-            self._peek_var.set(
-                f"{describe(ref)} は名前も ID も持たないため、"
-                "確実に見つけられません。別の場所を選んでください。"
-            )
-            self._tick_id = self.after(_PEEK_MS, self._tick)
-            return
+            if not is_positional_only(ref) or not self._confirm_positional(ref):
+                self._peek_var.set(
+                    f"{describe(ref)} は名前も ID も持たないため、"
+                    "確実に見つけられません。別の場所を選んでください。"
+                )
+                self._tick_id = self.after(_PEEK_MS, self._tick)
+                return
 
         self._picked = ref
         self._close()
         self._on_picked(ref)
+
+    def _confirm_positional(self, ref: ElementRef) -> bool:
+        """名前の無い要素を、位置で覚えてよいか確かめる。
+
+        アイコンだけのツールバーボタンは、名前も AutomationId も
+        ツールチップも持たないことがある。実行側は構造上の位置で探せるので
+        使えなくはないが、弱いことを承知してもらってから記録する。
+        """
+        label = describe(ref)
+        where = " > ".join(f"{kind}[{index}]" for kind, index in ref.index_path)
+        return messagebox.askyesno(
+            "名前のない要素です",
+            f"{label} には名前も AutomationId もツールチップもありません。\n\n"
+            f"画面の構造上の位置で探すことになります。\n{where}\n\n"
+            "対象アプリが更新されてボタンが増減すると、\n"
+            "黙って隣のものを操作します。\n\n"
+            "この要素を使いますか？",
+            parent=self,
+            icon="warning",
+        )
 
     def _cancel(self) -> None:
         self._picked = None

@@ -284,29 +284,52 @@ class MainWindow(ttk.Frame):
         self._form = StepForm(right, self, self._refresh_steps)
         self._form.grid(row=0, column=0, sticky="nsew")
 
+        # ボタンの名前は「操作するかしないか」が読めるものにする。
+        # 「試し実行」と「確認実行」は日本語として似ているのに、前者は実際に
+        # アプリを操作し、後者はしない。違いが分からないという指摘を受けた
         run_bar = ttk.Frame(right, padding=(12, 0))
         run_bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        run_bar.columnconfigure(3, weight=1)
-
-        self._upto_button = ttk.Button(
-            run_bar, text="ここまで試し実行", command=self._on_run_upto
-        )
-        self._upto_button.grid(row=0, column=0, padx=(0, 4))
+        run_bar.columnconfigure(4, weight=1)
 
         self._dry_button = ttk.Button(
-            run_bar, text="最初から確認実行", command=self._on_run_dry
+            run_bar, text="動かさず確認", command=self._on_run_dry
         )
-        self._dry_button.grid(row=0, column=1, padx=4)
+        self._dry_button.grid(row=0, column=0, padx=(0, 4))
+
+        # 操作する 3 つは、区切りを挟んで左から範囲が広がる順に並べる
+        ttk.Separator(run_bar, orient="vertical").grid(
+            row=0, column=1, sticky="ns", padx=6
+        )
+
+        self._only_button = ttk.Button(
+            run_bar, text="この手順だけ動かす", command=self._on_run_only
+        )
+        self._only_button.grid(row=0, column=2, padx=(0, 4))
+
+        self._upto_button = ttk.Button(
+            run_bar, text="ここまで動かす", command=self._on_run_upto
+        )
+        self._upto_button.grid(row=0, column=3, padx=4)
 
         self._run_button = ttk.Button(
-            run_bar, text="実行", command=self._on_run, width=10
+            run_bar, text="最初から動かす", command=self._on_run
         )
-        self._run_button.grid(row=0, column=2, padx=4)
+        self._run_button.grid(row=0, column=4, padx=4, sticky="w")
 
         self._cancel_button = ttk.Button(
             run_bar, text="中止", command=self._on_cancel, state="disabled", width=8
         )
-        self._cancel_button.grid(row=0, column=4, sticky="e")
+        self._cancel_button.grid(row=0, column=5, sticky="e")
+
+        ttk.Label(
+            right,
+            text=(
+                "［動かさず確認］はアプリを操作しません（対象が見つかるかだけ調べます）。"
+                "右の 3 つは実際に操作します。"
+            ),
+            foreground="#666666",
+            wraplength=520,
+        ).grid(row=2, column=0, sticky="w", padx=12, pady=(4, 0))
 
     def _build_log(self) -> None:
         frame = ttk.Frame(self)
@@ -339,13 +362,23 @@ class MainWindow(ttk.Frame):
         def done(ref: ElementRef) -> None:
             root.deiconify()
             on_picked(ref)
-            self._refresh_steps()
+            self._commit_and_refresh()
 
         dialog = PickerDialog(self, done)
         dialog.bind("<Destroy>", lambda _e: root.deiconify(), add="+")
 
     def choose_app(self, on_chosen: Callable[[dict[str, Any]], None]) -> None:
-        AppChooser(self, lambda params: (on_chosen(params), self._refresh_steps()))
+        AppChooser(self, lambda params: (on_chosen(params), self._commit_and_refresh()))
+
+    def _commit_and_refresh(self) -> None:
+        """入力値を Step に書き戻してから一覧を組み直す。
+
+        ピッカーやアプリ選択で値が入っても、collect() を通すまで Step には
+        届かない。書き戻さずに一覧だけ組み直すと、選んだ直後なのに
+        「(未指定) ⚠」が残って画面が嘘をつく。
+        """
+        self._form.collect()
+        self._refresh_steps()
 
     def choose_folder(
         self, initial: Path, title: str, on_chosen: Callable[[Path], None]
@@ -1021,18 +1054,43 @@ class MainWindow(ttk.Frame):
     def _on_run_upto(self) -> None:
         if self._selected < 0:
             messagebox.showinfo(
-                "ここまで試し実行", "左の一覧で、どこまで動かすかを選んでください。",
+                "ここまで動かす", "左の一覧で、どこまで動かすかを選んでください。",
                 parent=self,
             )
             return
         self._start_run(dry_run=False, upto=self._selected + 1)
 
-    def _start_run(self, *, dry_run: bool, upto: int | None = None) -> None:
+    def _on_run_only(self) -> None:
+        """選んだ手順 1 つだけを動かす。
+
+        手順を直したときに、その 1 つだけ試したい場面のためのもの。
+        前の手順は動かさないので、対象アプリは開いたままにしておく必要がある。
+        """
+        if self._selected < 0:
+            messagebox.showinfo(
+                "この手順だけ動かす", "左の一覧で、動かす手順を選んでください。",
+                parent=self,
+            )
+            return
+        self._start_run(dry_run=False, only=self._selected + 1)
+
+    def _start_run(
+        self, *, dry_run: bool, upto: int | None = None, only: int | None = None
+    ) -> None:
         if self._busy:
             return
 
         self._form.collect()
-        problems = self._scenario.validate()
+        if only is not None:
+            # 1 つだけ動かすときは、その手順しか見ない。組み立て途中の他の手順が
+            # 未入力でも、今直した 1 つを試せないと確かめながら組めないため
+            step = self._scenario.steps[only - 1]
+            problems = [
+                f"手順 {only}（{step.spec.label}）: {problem}"
+                for problem in self._scenario.step_problems(only - 1)
+            ]
+        else:
+            problems = self._scenario.validate()
         if problems:
             messagebox.showerror(
                 "実行できません", "\n".join(problems[:10]), parent=self
@@ -1055,7 +1113,7 @@ class MainWindow(ttk.Frame):
 
         def worker() -> None:
             try:
-                report = runner.run(upto=upto)
+                report = runner.run(upto=upto, only=only)
             except Exception as exc:  # noqa: BLE001 - 想定外は画面に出す
                 self._queue.put((self._on_run_error, exc))
             else:
@@ -1114,7 +1172,12 @@ class MainWindow(ttk.Frame):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         state = "disabled" if busy else "normal"
-        for button in (self._run_button, self._dry_button, self._upto_button):
+        for button in (
+            self._run_button,
+            self._dry_button,
+            self._upto_button,
+            self._only_button,
+        ):
             button.configure(state=state)
         self._cancel_button.configure(state="normal" if busy else "disabled")
 

@@ -13,7 +13,8 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 from typing import Any, Callable
 
-from logic.shortcuts import Shortcut, ShortcutError, list_shortcuts, resolve
+from logic.launch import LaunchError, resolve_launch
+from logic.shortcuts import Shortcut, ShortcutError, list_shortcuts
 
 _TICK_MS = 100
 
@@ -176,31 +177,47 @@ class AppChooser(tk.Toplevel):
         self._on_chosen(shortcut_to_params(shortcut))
 
     def _choose_file(self) -> None:
-        """一覧に無いアプリのための逃げ道。"""
+        """一覧に無いアプリのための逃げ道。
+
+        exe とは限らない。ショートカット（拡張子は問わない）や、
+        関連付けで別の exe が起動する固有拡張子のファイルも選べる。
+        どれを選んでも、ここで実体の exe と引数まで落として保存する。
+        """
         path = filedialog.askopenfilename(
             parent=self,
             title="起動するファイルを選ぶ",
-            filetypes=[("実行ファイル", "*.exe;*.bat;*.cmd"), ("すべて", "*.*")],
+            filetypes=[
+                ("実行ファイル・ショートカット", "*.exe;*.bat;*.cmd;*.lnk"),
+                ("すべて", "*.*"),
+            ],
         )
         if not path:
             return
 
         chosen = Path(path)
-        if chosen.suffix.lower() == ".lnk":
-            try:
-                shortcut = resolve(chosen, source="直接指定")
-            except ShortcutError as exc:
-                messagebox.showerror("エラー", str(exc), parent=self)
-                return
-            params = shortcut_to_params(shortcut)
-        else:
-            params = {
-                "name": chosen.stem,
-                "target": str(chosen),
-                "args": "",
-                "work_dir": str(chosen.parent),
-                "lnk": "",
-            }
+        try:
+            found = resolve_launch(chosen)
+        except LaunchError as exc:
+            messagebox.showerror("起動方法が分かりません", str(exc), parent=self)
+            return
+
+        # 選んだファイル自体が exe でなければ、何を選んだのかを残しておく。
+        # あとで手順を見たとき、exe だけだと元のファイルに辿り着けない
+        params = {
+            "name": chosen.stem,
+            "target": str(found.exe),
+            "args": found.args,
+            "work_dir": str(found.work_dir) if found.work_dir else "",
+            "lnk": "" if found.how == "実行ファイル" else str(chosen),
+        }
+
+        if found.how != "実行ファイル":
+            messagebox.showinfo(
+                "起動方法",
+                f"{chosen.name} は{found.how}でした。\n\n"
+                f"次のコマンドで起動します。\n{found.command}",
+                parent=self,
+            )
 
         self._close()
         self._on_chosen(params)
