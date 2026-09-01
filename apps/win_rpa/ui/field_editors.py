@@ -46,7 +46,10 @@ class EditorContext(Protocol):
         """アプリ選択を開く。"""
 
     def work_dir(self) -> Path:
-        """作業フォルダ（ファイル選択の初期位置）。"""
+        """この手順の時点で効いているフォルダ（ファイル選択の初期位置）。"""
+
+    def folders_here(self) -> tuple[Path, Path | None]:
+        """（この手順の時点の保存先, 作られているフォルダ）。"""
 
     def variables(self) -> dict[str, str]:
         """差し込み変数の今の値（プレビュー表示に使う）。"""
@@ -83,12 +86,15 @@ class FieldEditor(ttk.Frame):
 # 差し込み変数
 # ----------------------------------------------------------------------
 def _attach_variable_menu(parent: tk.Misc, entry: ttk.Entry) -> ttk.Menubutton:
-    """「差し込み ▼」ボタンを作る。
+    """「差し込み」ボタンを作る。
 
     {yyyymm} のような書き方をユーザーに覚えさせない。選ぶと入力欄の
     カーソル位置に挿し込まれる。
+    文字に ▼ は入れない。Menubutton は右端に ▼ を自分で描くため
+    （Menubutton.dropdown）、文字にも入れると 2 つ並んで見える。
     """
-    button = ttk.Menubutton(parent, text="差し込み ▼", width=11)
+    # 幅は指定しない。文字から ▼ を外したぶん、数字で決め打ちすると余白が余る
+    button = ttk.Menubutton(parent, text="差し込み")
     menu = tk.Menu(button, tearoff=False)
 
     for key, label in VARIABLE_LABELS.items():
@@ -107,13 +113,13 @@ def _attach_pattern_menu(
     patterns: tuple[tuple[str, str], ...],
     text: str,
 ) -> ttk.Menubutton:
-    """「型 ▼」ボタンを作る。選ぶと欄の中身をその型に置き換える。
+    """「型」ボタンを作る。選ぶと欄の中身をその型に置き換える。
 
     差し込みと違って追記ではなく総取り替えにする。フォルダ名は
     「年月だけ」「年の下に月」のように丸ごと決まることがほとんどで、
     継ぎ足すと打ち間違いの余地が残るため。
     """
-    button = ttk.Menubutton(parent, text=text, width=8)
+    button = ttk.Menubutton(parent, text=text)
     menu = tk.Menu(button, tearoff=False)
 
     for value, label in patterns:
@@ -419,7 +425,7 @@ class FolderEditor(FieldEditor):
 
     月次で回すので、毎月同じ名前のフォルダに書き続けるのはまずい。
     かといって {yyyymm} という書き方をユーザーに覚えさせたくないので、
-    ［型 ▼］で選ばせ、実際に出来上がる名前をその場に出す。
+    ［型］で選ばせ、実際に出来上がる名前をその場に出す。
     """
 
     def _build(self) -> None:
@@ -433,7 +439,7 @@ class FolderEditor(FieldEditor):
         ttk.Button(self, text="参照...", command=self._browse, width=8).grid(
             row=0, column=1, padx=(4, 0)
         )
-        _attach_pattern_menu(self, self._var, FOLDER_PATTERNS, "型 ▼").grid(
+        _attach_pattern_menu(self, self._var, FOLDER_PATTERNS, "型").grid(
             row=0, column=2, padx=(4, 0)
         )
         _attach_variable_menu(self, entry).grid(row=0, column=3, padx=(4, 0))
@@ -476,7 +482,12 @@ class FolderEditor(FieldEditor):
     def _refresh_preview(self) -> None:
         raw = self._var.get().strip()
         if not raw:
-            self._preview_var.set("（空のまま。今の保存先フォルダを使います）")
+            # 空にしたときに何が起きるかは項目ごとに違う（保存先の中に作る／
+            # 保存先から探す／作ったフォルダを使う）。ここで決め打ちにすると
+            # 嘘になるので、下に出る項目の説明に任せる
+            self._preview_var.set(
+                "（未指定）" if self.field.required else "（空のまま）"
+            )
             return
 
         expanded = expand(raw, self.context.variables())
@@ -504,7 +515,7 @@ class FileNameEditor(FieldEditor):
         entry = ttk.Entry(self, textvariable=self._var)
         entry.grid(row=0, column=0, sticky="ew")
 
-        _attach_pattern_menu(self, self._var, FILE_NAME_PATTERNS, "型 ▼").grid(
+        _attach_pattern_menu(self, self._var, FILE_NAME_PATTERNS, "型").grid(
             row=0, column=1, padx=(4, 0)
         )
         _attach_variable_menu(self, entry).grid(row=0, column=2, padx=(4, 0))
@@ -552,7 +563,7 @@ class FilePatternEditor(FieldEditor):
         ttk.Button(self, text="1 つ選ぶ...", command=self._browse, width=10).grid(
             row=0, column=1, padx=(4, 0)
         )
-        _attach_pattern_menu(self, self._var, FILE_PATTERNS, "型 ▼").grid(
+        _attach_pattern_menu(self, self._var, FILE_PATTERNS, "型").grid(
             row=0, column=2, padx=(4, 0)
         )
         _attach_variable_menu(self, entry).grid(row=0, column=3, padx=(4, 0))
@@ -588,7 +599,7 @@ class FilePatternEditor(FieldEditor):
         except (NotImplementedError, ValueError, OSError):
             # フルパスを入れると glob が投げる。打ち込み途中でも出るので
             # 例外にせず、そのまま案内だけ差し替える
-            self._preview_var.set("この書き方では探せません（［型 ▼］から選べます）")
+            self._preview_var.set("この書き方では探せません（［型］から選べます）")
             return
 
         if not hits:

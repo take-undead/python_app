@@ -75,9 +75,12 @@ class ActionSpec:
     fields: tuple[Field, ...]
     help: str = ""
     category: str = CAT_OTHER
-    # 先に置いておかないと成り立たないアクション名。
-    # 満たしていないと［＋ 手順を追加］で選べず、保存前の検証でも弾く
-    requires: str = ""
+    # 先に置いておかないと成り立たないアクション名。どれか 1 つあればよい。
+    # 満たしていないと保存前の検証で弾く
+    requires: tuple[str, ...] = ()
+    # この項目が埋まっていれば requires は問わない。
+    # 手順の中で場所を直接指定できるなら、手前の手順に頼る必要がないため
+    requires_unless: str = ""
 
 
 # 完了条件は複数のアクションで共通なので使い回す
@@ -200,10 +203,12 @@ ACTIONS: dict[str, ActionSpec] = {
         "dialog_button",
         "メッセージに応じる",
         (
-            Field("button", "choice", "押すボタン", required=True,
-                  choices=DIALOG_BUTTONS, default="OK"),
+            # どのダイアログか → その中のどのボタンか、の順。
+            # 「ボタンを押す」が 対象 → 押し方 の順なのと合わせる
             Field("dialog_title", "window_title", "ダイアログの題名",
                   help="空なら、出ているメッセージをそのまま対象にする"),
+            Field("button", "choice", "押すボタン", required=True,
+                  choices=DIALOG_BUTTONS, default="OK"),
             Field("optional", "bool", "出ていなければ飛ばす", default=True),
             Field("timeout", "int", "待ち時間（秒）", default=10),
         ),
@@ -276,9 +281,13 @@ ACTIONS: dict[str, ActionSpec] = {
         "make_folder",
         "フォルダを作る",
         (
+            # 場所 → 名前 の順に並べる。どこに作るかが決まらないと名前だけでは
+            # 置き場所が定まらないため、操作の順序と画面の順序を合わせる
+            Field("parent", "folder", "作る場所",
+                  help="空にすると、その時点の保存先の中に作る"
+                       "（前に「保存先フォルダを選ぶ」を置いた場合はその場所）"),
             Field("name", "folder", "フォルダ名", required=True,
-                  help="「型 ▼」から年月日などの自動設定を選べる"),
-            Field("parent", "folder", "作る場所"),
+                  help="「型」から年月日などの自動設定を選べる"),
             Field("set_as_work", "bool", "作ったフォルダを、以降の保存先にする",
                   default=True),
         ),
@@ -299,8 +308,12 @@ ACTIONS: dict[str, ActionSpec] = {
         "copy_files",
         "ファイルをコピー／移動する",
         (
+            # 「フォルダを作る」と同じく、探す場所を先に決めてから対象を選ぶ。
+            # 場所が決まらないと、選び方の下に出る「今そこに何件あるか」も
+            # どこを数えた件数なのか分からない
+            Field("from_dir", "folder", "探す場所",
+                  help="空にすると、その時点の保存先から探す"),
             Field("source", "file_pattern", "対象のファイル", required=True),
-            Field("from_dir", "folder", "探す場所"),
             Field("dest", "folder", "行き先のフォルダ", required=True),
             Field("modified", "date_range", "更新日で絞る",
                   help="ファイル名に日付が入っていないときに使う。"
@@ -324,16 +337,21 @@ ACTIONS: dict[str, ActionSpec] = {
         "merge_csv",
         "CSV をまとめる",
         (
+            # 場所を先に決める（「フォルダを作る」と同じ並び）。
+            # ここを指定すれば、手前に「フォルダを作る」が無くても動く
+            Field("folder", "folder", "まとめる場所",
+                  help="空にすると、手前の「フォルダを作る」で作った場所"
+                       "（それが無ければ、その時点の保存先）"),
             Field("output", "file_name", "できあがる名前", required=True,
                   default="まとめ_{yyyymmdd}.csv"),
             Field("add_source", "bool", "元ファイル名の列を足す", default=True),
             Field("min_rows", "int", "最低行数", default=2),
         ),
-        help="「フォルダを作る」で作ったフォルダの CSV を全部読み、"
-             "先頭付近にある日時の列で古い順に並べ替えて 1 つにまとめ、"
-             "同じフォルダに置く",
+        help="そのフォルダの CSV を全部読み、先頭付近にある日時の列で"
+             "古い順に並べ替えて 1 つにまとめ、同じフォルダに置く",
         category=CAT_OTHER,
-        requires="make_folder",
+        requires=("make_folder", "set_work_dir"),
+        requires_unless="folder",
     ),
     "close_app": ActionSpec(
         "close_app",
@@ -371,19 +389,39 @@ ACTIONS: dict[str, ActionSpec] = {
 }
 
 
-def requirement_error(spec: ActionSpec, earlier: list["Step"]) -> str:
+def requirement_error(
+    spec: ActionSpec,
+    earlier: list["Step"],
+    params: dict[str, Any] | None = None,
+) -> str:
     """先に必要な手順が無ければ、その理由を日本語で返す。無ければ空文字。
 
     「CSV をまとめる」のように、前の手順が決めたものを使うアクションがある。
-    置けてしまうと実行時まで気づけないので、置く前に止める。
+    実行するまで成り立たないと気づけないので、保存前の検証で止める。
+
+    ただし手順の中で場所を直接指定できるなら、手前の手順は要らない
+    （requires_unless）。params には編集中の手順の設定を渡す。
+    ［＋ 手順を追加］のように手順がまだ無い場面では None を渡す
+    ＝これから指定できるので止めない。
     """
     if not spec.requires:
         return ""
-    if any(step.action == spec.requires and step.enabled for step in earlier):
+    if spec.requires_unless:
+        if params is None:
+            return ""
+        if params.get(spec.requires_unless) not in (None, "", {}, []):
+            return ""
+    if any(step.action in spec.requires and step.enabled for step in earlier):
         return ""
 
-    needed = ACTIONS[spec.requires].label
-    return f"先に「{needed}」の手順が必要です"
+    needed = "」か「".join(ACTIONS[name].label for name in spec.requires)
+    message = f"先に「{needed}」の手順が必要です"
+    if spec.requires_unless:
+        label = next(
+            item.label for item in spec.fields if item.key == spec.requires_unless
+        )
+        message += f"。この手順の「{label}」を指定してもかまいません"
+    return message
 
 
 def actions_by_category() -> list[tuple[str, list[tuple[str, ActionSpec]]]]:
@@ -630,6 +668,59 @@ WAIT_KINDS: dict[str, str] = {
 
 
 # ----------------------------------------------------------------------
+# その時点のフォルダ
+# ----------------------------------------------------------------------
+def _resolve_under(raw: str, base: Path, variables: dict[str, str]) -> Path:
+    """差し込みを展開し、相対なら base の下に置く。"""
+    path = Path(expand(raw, variables))
+    return path if path.is_absolute() else base / path
+
+
+def folders_at(
+    base: Path, earlier: list["Step"], scenario_name: str = ""
+) -> tuple[Path, Path | None]:
+    """手順の並びをたどって、その時点のフォルダを返す。
+
+    返すのは（保存先, 直近の「フォルダを作る」で作った場所）。
+    「保存先フォルダを選ぶ」「フォルダを作る」が保存先を切り替えるので、
+    ［参照...］の初期位置もプレビューも実行時もここを基準にする。
+    3 か所で別々にたどると画面と実際がずれるため、1 か所に集めてある。
+
+    フォルダは作らない。場所を決めるだけ。指定が壊れている手順は飛ばす
+    （組み立て途中の手順があっても、他の手順の基準は出せたほうがよい）。
+    """
+    current = base
+    created: Path | None = None
+
+    for step in earlier:
+        if not step.enabled:
+            continue
+        variables = build_variables(current, scenario_name=scenario_name)
+        try:
+            if step.action == "set_work_dir":
+                raw = str(step.params.get("path", "")).strip()
+                if raw:
+                    current = _resolve_under(raw, current, variables)
+            elif step.action == "make_folder":
+                name = str(step.params.get("name", "")).strip()
+                if not name:
+                    continue
+                parent_raw = str(step.params.get("parent", "")).strip()
+                parent = (
+                    _resolve_under(parent_raw, current, variables)
+                    if parent_raw
+                    else current
+                )
+                created = _resolve_under(name, parent, variables)
+                if bool(step.params.get("set_as_work", True)):
+                    current = created
+        except (ValueError, OSError):
+            continue
+
+    return current, created
+
+
+# ----------------------------------------------------------------------
 # 差し込み変数
 # ----------------------------------------------------------------------
 def build_variables(
@@ -774,10 +865,13 @@ class Step:
         if self.action == "assert_file":
             return f"「{Path(self.params.get('path', '')).name}」ができたか確認する"
         if self.action == "merge_csv":
+            # 一覧が横に伸びるので、指定してあってもフルパスは出さない
+            # （フルパスは項目の下のプレビューに出る）
+            where = Path(str(self.params.get("folder", "")).strip()).name
             return (
-                f"フォルダの CSV を日時順にまとめて"
-                f"「{self.params.get('output', '')}」にする"
-            )
+                f"「{where}」の CSV を日時順にまとめて" if where
+                else "フォルダの CSV を日時順にまとめて"
+            ) + f"「{self.params.get('output', '')}」にする"
         if self.action == "make_folder":
             return f"フォルダ「{self.params.get('name', '')}」を作る"
         if self.action == "set_work_dir":
@@ -904,7 +998,7 @@ class Scenario:
         step = self.steps[index]
         problems = step.validate()
 
-        problem = requirement_error(step.spec, self.steps[:index])
+        problem = requirement_error(step.spec, self.steps[:index], step.params)
         if problem:
             problems.append(problem)
         return problems

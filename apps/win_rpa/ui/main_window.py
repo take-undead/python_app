@@ -24,6 +24,7 @@ from logic.actions import (
     Step,
     actions_by_category,
     build_variables,
+    folders_at,
     requirement_error,
 )
 from logic.picker import ElementRef
@@ -321,7 +322,7 @@ class MainWindow(ttk.Frame):
         )
         self._cancel_button.grid(row=0, column=5, sticky="e")
 
-        ttk.Label(
+        run_note = ttk.Label(
             right,
             text=(
                 "［動かさず確認］はアプリを操作しません（対象が見つかるかだけ調べます）。"
@@ -329,7 +330,14 @@ class MainWindow(ttk.Frame):
             ),
             foreground="#666666",
             wraplength=520,
-        ).grid(row=2, column=0, sticky="w", padx=12, pady=(4, 0))
+        )
+        run_note.grid(row=2, column=0, sticky="w", padx=12, pady=(4, 0))
+
+        # 折り返し幅を固定にすると、パネルを狭めたときに文が右で切れる
+        right.bind(
+            "<Configure>",
+            lambda e: run_note.configure(wraplength=max(e.width - 24, 200)),
+        )
 
     def _build_log(self) -> None:
         frame = ttk.Frame(self)
@@ -427,14 +435,30 @@ class MainWindow(ttk.Frame):
         messagebox.showerror("フォルダを選べませんでした", str(exc), parent=self)
 
     def work_dir(self) -> Path:
-        return self._scenario.resolved_work_dir(storage.work_root())
+        """編集中の手順の時点で効いているフォルダ。
+
+        ［参照...］の初期位置とプレビューの基準になる。手前に
+        「保存先フォルダを選ぶ」「フォルダを作る」があれば、そこが基準。
+        シナリオの出発点を返していたころは、手順 2 で E:\\test を選んでも
+        手順 5 の［参照...］がアプリの work フォルダから始まっていた。
+        """
+        return self.folders_here()[0]
+
+    def folders_here(self) -> tuple[Path, Path | None]:
+        """（この手順の時点の保存先, 作られているフォルダ）を返す。
+
+        実行時と同じたどり方（logic.actions.folders_at）を使う。
+        別々に数えると、画面に出る場所と実際に書かれる場所がずれる。
+        """
+        earlier = self._scenario.steps[: max(self._selected, 0)]
+        return folders_at(
+            self._scenario.resolved_work_dir(storage.work_root()),
+            earlier,
+            scenario_name=self._scenario.name,
+        )
 
     def variables(self) -> dict[str, str]:
-        """差し込み変数の今の値。フォルダ名のプレビューに使う。
-
-        実行時に切り替わる保存先までは追えないので、ここで出るのは
-        「出発点のフォルダで組んだらこうなる」という目安。
-        """
+        """差し込み変数の今の値。フォルダ名のプレビューに使う。"""
         return build_variables(self.work_dir(), scenario_name=self._scenario.name)
 
     # ------------------------------------------------------------------

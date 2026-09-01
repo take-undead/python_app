@@ -33,6 +33,7 @@ from logic.actions import (
     describe_date_range,
     describe_keys,
     expand,
+    folders_at,
     menu_parts,
     requirement_error,
     resolve_date_range,
@@ -162,6 +163,7 @@ class Runner:
         only を指定すると、その手順 1 つだけを実行する（「この手順だけ実行」用）。
         **前の手順は動かさない**ので、対象アプリは自分で開いておく必要がある。
         要素は記録されたウィンドウ題名から探すため、起動済みなら見つかる。
+        ただしフォルダの場所だけは手前の手順から引き継ぐ（_prime_folders）。
         """
         report = RunReport(dry_run=self._dry_run)
         self._work_dir.mkdir(parents=True, exist_ok=True)
@@ -191,6 +193,7 @@ class Runner:
                 f"{mode}: 手順 {only} だけを動かします"
                 "（前の手順は動かしません。対象アプリは開いておくこと）",
             )
+            self._prime_folders(preceding)
         else:
             self._emit("info", f"{mode}を開始します（{len(numbered)} 手順）")
 
@@ -198,7 +201,7 @@ class Runner:
         # 8 手順進んでから「先にフォルダを作る手順が要る」と言われても遅い
         for position, (index, step) in enumerate(numbered):
             before = preceding + [item for _, item in numbered[:position]]
-            problem = requirement_error(step.spec, before)
+            problem = requirement_error(step.spec, before, step.params)
             if not problem:
                 continue
             message = f"{problem}（手順 {index}: {step.spec.label}）"
@@ -223,6 +226,36 @@ class Runner:
         if report.ok and not self._cancelled:
             self._emit("ok", f"{mode}が完了しました。")
         return report
+
+    def _prime_folders(self, steps: list[Step]) -> None:
+        """1 つだけ動かすとき、手前の手順が決めるはずだったフォルダを引き継ぐ。
+
+        操作はしないが、場所の話だけは引き継がないと成り立たない。
+        「保存先にする」「フォルダを作る」を飛ばした状態で「CSV をまとめる」を
+        動かすと、まとめる先が分からないまま失敗するため。
+        手前の手順の指定が壊れていても、動かすのはこの 1 手順なので止めない。
+        """
+        work_dir, created = folders_at(
+            self._work_dir, steps, scenario_name=self._scenario.name
+        )
+        self._created_folder = created
+        # 引き継いだことは下でまとめて出すので、_set_work_dir は通さない
+        self._work_dir = work_dir
+        self._variables["work_dir"] = str(work_dir)
+
+        # 保存先は無いと書き込む手順が失敗する。手前の手順を動かしていれば
+        # 出来ていた場所なので、ここで用意しておく（確認実行では作らない）
+        if not self._dry_run:
+            try:
+                self._work_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._emit("warn", f"  保存先を用意できませんでした: {exc}")
+
+        self._emit("info", f"  保存先: {self._work_dir}（手前の手順から引き継ぎ）")
+        if self._created_folder is not None:
+            self._emit(
+                "info", f"  まとめる先: {self._created_folder}（同上）"
+            )
 
     def _run_step(self, index: int, step: Step) -> StepResult:
         label = f"手順 {index}: {step.describe()}"
@@ -815,18 +848,19 @@ class Runner:
         return f"{path} に保存しました"
 
     def _do_merge_csv(self, step: Step) -> str:
-        """作ったフォルダの CSV を全部まとめ、日付順に並べて同じ場所に置く。
+        """指定したフォルダの CSV を全部まとめ、日付順に並べて同じ場所に置く。
 
         対象を選ばせず「そのフォルダの CSV 全部」に決め打ちにしてある。
-        まとめる先が「フォルダを作る」で作った場所なので、そこに入っている
-        ものが対象、という以外の解釈が無いため。
+        まとめる先のフォルダに入っているものが対象、という以外の
+        解釈が無いため。
         """
-        folder = self._created_folder
-        if folder is None:
-            raise AutomationError(
-                "まとめる先のフォルダが決まっていません。"
-                "先に「フォルダを作る」の手順を入れてください。"
-            )
+        raw = str(step.params.get("folder", "")).strip()
+        if raw:
+            folder = self._resolve_path(raw)
+        else:
+            # 手前の「フォルダを作る」で作った場所。それが無ければ
+            # その時点の保存先（「保存先フォルダを選ぶ」だけ置いた場合）
+            folder = self._created_folder or self._work_dir
 
         name = expand(str(step.params.get("output", "")), self._variables).strip()
         name = Path(name.replace("\\", "/")).name
@@ -896,13 +930,17 @@ class Runner:
     # ------------------------------------------------------------------
     # ファイル操作
     # ------------------------------------------------------------------
-    def _do_make_folder(self, step: Step) -> str:
+    def _folder_target(self, step: Step) -> Path:
+        """「フォルダを作る」がどこを指しているかを決める（作りはしない）。"""
         name = self._folder_name(str(step.params.get("name", "")))
         parent_raw = str(step.params.get("parent", "")).strip()
         parent = self._resolve_path(parent_raw) if parent_raw else self._work_dir
 
         target = Path(name)
-        folder = target if target.is_absolute() else parent / target
+        return target if target.is_absolute() else parent / target
+
+    def _do_make_folder(self, step: Step) -> str:
+        folder = self._folder_target(step)
         set_as_work = bool(step.params.get("set_as_work", True))
 
         # 「CSV をまとめる」がここを読む。確認実行でも覚えておく
@@ -978,7 +1016,7 @@ class Runner:
             # 「想定外のエラー」で終わらせず、何が悪いかを出す
             raise AutomationError(
                 f"「{pattern}」はファイルの選び方として使えません。"
-                "［型 ▼］から選び直してください。\n"
+                "［型］から選び直してください。\n"
                 f"（{exc}）"
             ) from exc
 
