@@ -25,8 +25,9 @@ from pywinauto import Application, Desktop, keyboard
 from pywinauto.controls.uiawrapper import UIAWrapper
 from pywinauto.uia_element_info import UIAElementInfo
 
-from logic import appinfo, launch, merger, picker, winfind
+from logic import appinfo, clipboard, launch, merger, picker, recorder, winfind
 from logic.actions import (
+    READ_MANNERS,
     Scenario,
     Step,
     build_variables,
@@ -42,6 +43,25 @@ from logic.picker import ElementRef, describe as describe_element
 
 # 要素が見つかるまでの待ち・確認の刻み
 _POLL_SEC = 0.4
+
+# Ctrl+C を送ってから、クリップボードに入るまで待つ上限。
+# 対象アプリが応答するのを待つだけなので短くてよい
+_CLIPBOARD_WAIT_SEC = 3.0
+
+# 表示を読むとき、値のほうを先に見る種類。
+# **入力欄の UIA の名前は、中身ではなく隣のラベルの文字**になることがある
+# （WinForms がそう。「合計金額」というラベルの右の欄を window_text() で
+# 読むと "合計金額" が返り、金額そのものは取れない）
+_VALUE_FIRST_TYPES = frozenset({"Edit", "Document", "ComboBox", "Spinner"})
+
+# 「選択してコピーする」で送る選択のしかた。上から順に試す。
+# Ctrl+A は一覧や独自コントロールでは効くが、**WinForms の 1 行入力欄では
+# 効かない**（実測）。効かなかったときのために、先頭から末尾までを
+# 選ぶ書き方に落とす
+_SELECT_KEYS: tuple[tuple[str, ...], ...] = (
+    ("^a",),
+    ("^{HOME}", "^+{END}"),
+)
 
 # 照合に使った手段。上ほど信頼できる
 MATCH_AUTO_ID = "AutomationId"
@@ -290,6 +310,7 @@ class Runner:
             "assert_text": self._do_assert_text,
             "assert_file": self._do_assert_file,
             "screenshot": self._do_screenshot,
+            "record_value": self._do_record_value,
             "merge_csv": self._do_merge_csv,
             "make_folder": self._do_make_folder,
             "set_work_dir": self._do_set_work_dir,
@@ -846,6 +867,181 @@ class Runner:
         except OSError as exc:
             raise AutomationError(f"画面を保存できませんでした: {exc}") from exc
         return f"{path} に保存しました"
+
+    def _do_record_value(self, step: Step) -> str:
+        """画面に出ている数値を、記録用の CSV の末尾に 1 行足す。
+
+        対象アプリが CSV を吐いてくれない値（画面にしか出ない集計結果）を
+        貯めるための手順。動かすたびに 1 行増える。
+        """
+        ref = self._require_element(step)
+        manner = str(step.params.get("how", READ_MANNERS[0]))
+        label = expand(str(step.params.get("label", "")), self._variables).strip()
+        number_only = bool(step.params.get("number_only", True))
+        path = self._record_path(step)
+
+        if self._dry_run:
+            # クリップボードは触らない。確認実行が人の作業中に走ることがあり、
+            # 操作しないはずの実行で中身を消すわけにはいかない
+            self._probe(ref, step)
+            return (
+                f"「{label}」を {path} に 1 行足す予定です"
+                f"（今 {recorder.row_count(path)} 行）"
+            )
+
+        control, how = self._resolve(ref, self._timeout(step))
+        self._warn_if_fallback(ref, how)
+
+        raw = self._read_value(control, manner, ref).strip()
+        value = raw
+        if number_only:
+            value = recorder.to_number(raw)
+            if not value:
+                raise AutomationError(
+                    f"{describe_element(ref)} の表示「{raw}」から数値を"
+                    "取り出せませんでした。\n"
+                    "数字が出ていない場所を指しているか、処理がまだ終わって"
+                    "いない可能性があります。数字以外を記録したいときは"
+                    "「数値だけを取り出す」を外してください。"
+                )
+            if value != raw:
+                self._emit("info", f"  読み取り: 「{raw}」 → {value}")
+
+        try:
+            rows = recorder.append(
+                path,
+                scenario=self._scenario.name,
+                label=label,
+                value=value,
+                raw=raw,
+            )
+        except recorder.RecordError as exc:
+            raise AutomationError(str(exc)) from exc
+
+        return f"「{label}」に {value} を記録しました（{path} の {rows} 行目）"
+
+    def _record_path(self, step: Step) -> Path:
+        """記録先のファイル。拡張子が無ければ .csv を付ける。"""
+        raw = str(step.params.get("file", "")).strip()
+        if not raw:
+            raise AutomationError("記録するファイルが指定されていません。")
+        if not raw.lower().endswith(".csv"):
+            raw += ".csv"
+        return self._resolve_path(raw)
+
+    def _read_value(
+        self, control: UIAWrapper, manner: str, ref: ElementRef
+    ) -> str:
+        """画面に出ている値を読む。読み取り方は手順が持っている。
+
+        表示から読むときは、種類によって「名前」と「値」のどちらを先に
+        見るかを変える。入力欄は名前が隣のラベルの文字になることがあり、
+        名前を先に読むとラベルのほうを記録してしまう。
+        """
+        if manner != READ_MANNERS[0]:
+            return self._copy_value(control, manner, ref)
+
+        name_text = self._text_of(control)
+        value_text = self._value_of(control)
+        if ref.control_type in _VALUE_FIRST_TYPES:
+            name_text, value_text = value_text, name_text
+
+        text = name_text if name_text.strip() else value_text
+        if not text.strip():
+            raise AutomationError(
+                f"{describe_element(ref)} から文字を読めませんでした。\n"
+                "表示を公開していない場所の可能性があります。"
+                "「読み取り方」を「選択してコピーする」に変えて試してください。"
+            )
+        return text
+
+    def _copy_value(
+        self, control: UIAWrapper, manner: str, ref: ElementRef
+    ) -> str:
+        """対象アプリにコピーさせて、クリップボードから受け取る。
+
+        UIA から読めない表示（独自描画の欄、一覧のセル）のための道。
+        全選択が効かない場所もあるので、クリックしてから Ctrl+C だけを
+        送る形も選べるようにしてある（一覧のセルはこちら。全選択すると
+        表ぜんぶがコピーされてしまう）。
+        """
+        try:
+            control.set_focus()
+        except Exception:  # noqa: BLE001 - 前面に出せなくてもコピーできることがある
+            pass
+
+        if manner == READ_MANNERS[2]:
+            try:
+                control.click_input()
+            except Exception as exc:  # noqa: BLE001
+                raise AutomationError(
+                    f"{describe_element(ref)} をクリックできませんでした: {exc}"
+                ) from exc
+            time.sleep(_POLL_SEC)
+            attempts: tuple[tuple[str, ...], ...] = ((),)
+        else:
+            attempts = _SELECT_KEYS
+
+        for number, select_keys in enumerate(attempts, start=1):
+            last = number == len(attempts)
+            text = self._copy_once(
+                control, ref, select_keys,
+                _CLIPBOARD_WAIT_SEC if last else 1.0,
+            )
+            if not text.strip():
+                continue
+            if number > 1:
+                self._emit(
+                    "info",
+                    "  Ctrl+A では選択できなかったので、"
+                    "先頭から末尾までを選んでコピーしました。",
+                )
+            return text
+
+        raise AutomationError(
+            f"{describe_element(ref)} をコピーできませんでした"
+            "（クリップボードが空のままです）。\n"
+            "選択できない場所の可能性があります。「読み取り方」を"
+            "「表示から読む」に変えるか、手前に「キーを押す」で選ぶ手順を"
+            "入れてください。"
+        )
+
+    def _copy_once(
+        self,
+        control: UIAWrapper,
+        ref: ElementRef,
+        select_keys: tuple[str, ...],
+        wait: float,
+    ) -> str:
+        """選択してコピーし、クリップボードに入るまで待つ。空なら空文字。"""
+        # 送る前に空にする。コピーが効かなかったときに、前から入っていた
+        # 文字を「読み取った値」として記録してしまわないため
+        try:
+            clipboard.clear()
+        except clipboard.ClipboardError as exc:
+            raise AutomationError(str(exc)) from exc
+
+        try:
+            for keys in select_keys:
+                control.type_keys(keys)
+                time.sleep(_POLL_SEC)
+            control.type_keys("^c")
+        except Exception as exc:  # noqa: BLE001
+            raise AutomationError(
+                f"{describe_element(ref)} にコピーの操作を送れませんでした: {exc}"
+            ) from exc
+
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                text = clipboard.read_text()
+            except clipboard.ClipboardError as exc:
+                raise AutomationError(str(exc)) from exc
+            if text.strip():
+                return text
+            if time.monotonic() >= deadline:
+                return ""
+            time.sleep(_POLL_SEC)
 
     def _do_merge_csv(self, step: Step) -> str:
         """指定したフォルダの CSV を全部まとめ、日付順に並べて同じ場所に置く。
@@ -1624,6 +1820,19 @@ class Runner:
         except Exception:  # noqa: BLE001
             return ""
         return text or ""
+
+    @staticmethod
+    def _value_of(control: UIAWrapper) -> str:
+        """表示名を持たない欄の中身を、古い形式の値から読む。
+
+        入力欄やラベルは window_text() で読めるが、独自のコントロールだと
+        空を返しつつ LegacyIAccessible には値が入っていることがある。
+        """
+        try:
+            value = control.legacy_properties().get("Value", "")
+        except Exception:  # noqa: BLE001 - 対応していない要素もある
+            return ""
+        return str(value or "")
 
     def _capture_failure(self, index: int) -> Path | None:
         """失敗した瞬間の画面を残す。

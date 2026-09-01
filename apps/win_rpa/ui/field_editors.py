@@ -17,13 +17,14 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Any, Callable, Protocol
 
-from logic import winfind
+from logic import recorder, winfind
 from logic.actions import (
     DATE_RANGE_LABELS,
     DATE_RANGES,
     FILE_NAME_PATTERNS,
     FILE_PATTERNS,
     FOLDER_PATTERNS,
+    RECORD_FILE_PATTERNS,
     KEY_CHOICES,
     KEY_LABELS,
     VARIABLE_LABELS,
@@ -545,6 +546,62 @@ class FileNameEditor(FieldEditor):
         self._var.set("" if value is None else str(value))
 
 
+class RecordFileEditor(FieldEditor):
+    """値を足していく記録用ファイル。
+
+    「できあがるファイルの名前」と違い、**同じファイルに足し続ける**のが
+    目的なので、今そのファイルが何行あるかをその場に出す。指定を間違えて
+    毎回別のファイルを作っている（行が増えていない）ことに、実行してから
+    ではなく組み立てている最中に気づけるようにするため。
+    """
+
+    def _build(self) -> None:
+        self._var = tk.StringVar(value=str(self.field.default or ""))
+        self._preview_var = tk.StringVar(value="")
+
+        self.columnconfigure(0, weight=1)
+        entry = ttk.Entry(self, textvariable=self._var)
+        entry.grid(row=0, column=0, sticky="ew")
+
+        _attach_pattern_menu(self, self._var, RECORD_FILE_PATTERNS, "型").grid(
+            row=0, column=1, padx=(4, 0)
+        )
+        _attach_variable_menu(self, entry).grid(row=0, column=2, padx=(4, 0))
+
+        ttk.Label(
+            self, textvariable=self._preview_var, foreground="#666666", wraplength=420
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+        self._var.trace_add("write", lambda *_: self._refresh_preview())
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        raw = self._var.get().strip()
+        if not raw:
+            self._preview_var.set("（未指定）")
+            return
+
+        name = expand(raw, self.context.variables())
+        if not name.lower().endswith(".csv"):
+            name += ".csv"
+
+        path = Path(name)
+        if not path.is_absolute():
+            path = self.context.work_dir() / path
+
+        if not path.is_file():
+            self._preview_var.set(f"→ {path}   ← まだありません（動かすと作られます）")
+            return
+        rows = recorder.row_count(path)
+        self._preview_var.set(f"→ {path}（今 {rows} 行。動かすと 1 行足します）")
+
+    def get(self) -> Any:
+        return self._var.get()
+
+    def set(self, value: Any) -> None:
+        self._var.set("" if value is None else str(value))
+
+
 class FilePatternEditor(FieldEditor):
     """まとめて扱うファイルの選び方。
 
@@ -827,6 +884,7 @@ _EDITORS: dict[str, type[FieldEditor]] = {
     "folder": FolderEditor,
     "file_pattern": FilePatternEditor,
     "file_name": FileNameEditor,
+    "record_file": RecordFileEditor,
     "element": ElementEditor,
     "app": AppEditor,
     "wait": WaitEditor,

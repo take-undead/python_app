@@ -25,7 +25,7 @@ _NO_WHEEL = frozenset(
 # フォルダを基準にする項目。この種類を持つ手順にだけ「今の場所」を出す
 # （「ボタンを押す」に保存先を出しても読み飛ばすだけなので）
 _USES_FOLDER = frozenset(
-    {"folder", "path", "save_path", "file_pattern", "file_name"}
+    {"folder", "path", "save_path", "file_pattern", "file_name", "record_file"}
 )
 
 # 種類の一覧。［＋ 手順を追加］と同じ並び（分類ごと）にしておく。

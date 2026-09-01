@@ -30,7 +30,7 @@ $font = New-Object System.Drawing.Font('Meiryo UI', 10)
 $form = New-Object System.Windows.Forms.Form
 $form.Text = '売上管理システム'
 $form.Name = 'frmMain'
-$form.ClientSize = New-Object System.Drawing.Size(460, 250)
+$form.ClientSize = New-Object System.Drawing.Size(460, 290)
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
 $form.Font = $font
@@ -92,11 +92,30 @@ $btnExport.Size = New-Object System.Drawing.Size(110, 34)
 $btnExport.Enabled = $false          # 集計するまで押せない（待ち条件の検証用）
 $form.Controls.Add($btnExport)
 
+# --- 合計金額（画面にしか出ない数値の検証用）----------------------------
+# CSV には出さない。「表示された数値を記録する」で拾う対象。
+# 桁区切り付きで出すのは、数値の取り出し（1,234,567 → 1234567）を試すため
+$lblTotal = New-Object System.Windows.Forms.Label
+$lblTotal.Text = '合計金額'
+$lblTotal.Name = 'lblTotal'
+$lblTotal.Location = New-Object System.Drawing.Point(20, 176)
+$lblTotal.Size = New-Object System.Drawing.Size(80, 24)
+$form.Controls.Add($lblTotal)
+
+$txtTotal = New-Object System.Windows.Forms.TextBox
+$txtTotal.Name = 'txtTotal'
+$txtTotal.Text = '0'
+$txtTotal.ReadOnly = $true
+$txtTotal.TextAlign = 'Right'
+$txtTotal.Location = New-Object System.Drawing.Point(104, 173)
+$txtTotal.Size = New-Object System.Drawing.Size(160, 24)
+$form.Controls.Add($txtTotal)
+
 # --- 状態表示 -----------------------------------------------------------
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Name = 'lblStatus'
 $lblStatus.Text = '準備完了'
-$lblStatus.Location = New-Object System.Drawing.Point(20, 180)
+$lblStatus.Location = New-Object System.Drawing.Point(20, 216)
 $lblStatus.Size = New-Object System.Drawing.Size(420, 26)
 $lblStatus.BorderStyle = 'FixedSingle'
 $lblStatus.TextAlign = 'MiddleLeft'
@@ -104,6 +123,7 @@ $form.Controls.Add($lblStatus)
 
 # --- 集計（時間のかかる処理を模す）--------------------------------------
 $script:rowCount = 0
+$script:total = 0
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = [Math]::Max(1, $Delay) * 1000
@@ -111,12 +131,15 @@ $timer.Interval = [Math]::Max(1, $Delay) * 1000
 $timer.Add_Tick({
     $timer.Stop()
     $script:rowCount = Get-Random -Minimum 80 -Maximum 400
+    $script:total = $script:rowCount * (Get-Random -Minimum 1000 -Maximum 9000)
+    $txtTotal.Text = '{0:N0}' -f $script:total
     $lblStatus.Text = '集計完了（' + $script:rowCount + ' 件）'
     $btnAggregate.Enabled = $true
     $btnExport.Enabled = $true
 })
 
 $btnAggregate.Add_Click({
+    $txtTotal.Text = '0'
     $lblStatus.Text = '集計中...'
     $btnAggregate.Enabled = $false
     $btnExport.Enabled = $false

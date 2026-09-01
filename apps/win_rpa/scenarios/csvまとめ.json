@@ -1,5 +1,43 @@
 {
   "name": "csvまとめ",
   "work_dir": "",
-  "steps": []
+  "steps": [
+    {
+      "id": "cda01819",
+      "action": "set_work_dir",
+      "enabled": true,
+      "params": {
+        "create": true,
+        "path": "E:\\test\\mix"
+      }
+    },
+    {
+      "id": "a986d7e9",
+      "action": "copy_files",
+      "enabled": true,
+      "params": {
+        "mode": "コピー",
+        "on_exists": "飛ばす",
+        "min_count": 1,
+        "from_dir": "E:\\test",
+        "source": "*",
+        "dest": "{yyyymm}",
+        "modified": {
+          "kind": "none"
+        },
+        "rename": ""
+      }
+    },
+    {
+      "id": "898dc017",
+      "action": "merge_csv",
+      "enabled": true,
+      "params": {
+        "output": "まとめ_{yyyymmdd}.csv",
+        "add_source": true,
+        "min_rows": 2,
+        "folder": "{yyyymm}"
+      }
+    }
+  ]
 }

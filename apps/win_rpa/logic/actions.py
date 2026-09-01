@@ -42,6 +42,7 @@ class Field:
         folder       フォルダ（参照で選ぶか、年月日などの型から組み立てる）
         file_pattern まとめて扱うファイルの選び方（すべて／CSV すべて…）
         file_name    できあがるファイルの名前（型から選ぶ）
+        record_file  値を足していく記録用ファイル（型から選ぶ。今の行数を出す）
         element      ピッカーで採取した要素
         wait         完了条件（専用の小さな編集欄）
         app          ショートカット一覧から選んだアプリ
@@ -98,6 +99,14 @@ _TIMEOUT_FIELD = Field(
 # 押し方。左クリックだけでは足りない場面（一覧の項目を開く、右クリック
 # メニューを出す）が業務アプリでは普通にあるため、選べるようにしておく
 CLICK_MANNERS: tuple[str, ...] = ("左クリック", "ダブルクリック", "右クリック")
+
+# 画面に出ている値の読み取り方。表示から読めない場所（独自描画の欄、
+# 一覧のセル）があるので、対象アプリにコピーさせて受け取る道も用意する
+READ_MANNERS: tuple[str, ...] = (
+    "表示から読む",
+    "選択してコピーする",
+    "クリックしてからコピーする",
+)
 
 # ダイアログのボタン。日本語 Windows でもボタン名が英語のままのものが
 # あるので、ここでは押したい意味だけを選ばせ、実際の照合は runner が行う
@@ -275,6 +284,39 @@ ACTIONS: dict[str, ActionSpec] = {
         ),
         help="そのときの画面を保存先フォルダに残す。月に 1 回しか動かさないので、"
              "「本当にこの内容で出力したか」を後から見られるようにしておく",
+        category=CAT_CHECK,
+    ),
+    "record_value": ActionSpec(
+        "record_value",
+        "表示された数値を記録する",
+        (
+            Field("target", "element", "数値が出ている場所", required=True),
+            Field(
+                "how", "choice", "読み取り方", choices=READ_MANNERS,
+                default=READ_MANNERS[0],
+                help="まず「表示から読む」で試す。読めない場所"
+                     "（独自描画の欄・一覧のセル）のときだけコピーを使う。"
+                     "コピーするとクリップボードの中身は入れ替わる",
+            ),
+            Field(
+                "label", "text", "項目名", required=True,
+                help="記録の「項目」列に入る名前。1 つのファイルに複数の値を"
+                     "記録できるので、何の数値かがここで分かるようにする",
+            ),
+            Field(
+                "file", "record_file", "記録するファイル", required=True,
+                default="{scenario}_記録.csv",
+                help="動かすたびに、このファイルの末尾に 1 行足す",
+            ),
+            Field(
+                "number_only", "bool", "数値だけを取り出す", default=True,
+                help="「1,234 件」から 1234 だけを取り出す。"
+                     "外すと表示されている文字をそのまま記録する",
+            ),
+            _TIMEOUT_FIELD,
+        ),
+        help="画面に出ている数値を、日時と一緒に記録用の CSV の末尾に足す。"
+             "動かすたびに 1 行増えるので、月をまたいでも 1 本の連続データになる",
         category=CAT_CHECK,
     ),
     "make_folder": ActionSpec(
@@ -461,6 +503,17 @@ FILE_NAME_PATTERNS: tuple[tuple[str, str], ...] = (
     ("まとめ_{yyyymm}.csv", "まとめ＋年月（まとめ_202608.csv）"),
     ("{scenario}_{yyyymm}.csv", "シナリオ名＋年月（売上集計_202608.csv）"),
     ("{scenario}_{prev_yyyymm}.csv", "シナリオ名＋前月（売上集計_202607.csv）"),
+)
+
+# 値を足していく記録用ファイルの名前の型。
+# 「できあがるファイル」と違い、**毎回同じファイルに足す**のが基本なので、
+# 日付で名前が変わる型（{yyyymmdd}）は出さない。1 回動かすたびに別の
+# ファイルが出来ると、貯めて眺めるという目的が果たせないため
+RECORD_FILE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("{scenario}_記録.csv", "シナリオ名＋記録（ずっと同じファイルに足す）"),
+    ("記録_{yyyy}.csv", "記録＋年（記録_2026.csv・年ごとに分ける）"),
+    ("記録_{yyyymm}.csv", "記録＋年月（記録_202608.csv・月ごとに分ける）"),
+    ("{scenario}_{yyyy}.csv", "シナリオ名＋年（売上集計_2026.csv）"),
 )
 
 # まとめて扱うファイルの選び方
@@ -857,6 +910,13 @@ class Step:
             return f"開くダイアログで「{Path(self.params.get('path', '')).name}」を開く"
         if self.action == "screenshot":
             return f"画面を「{self.params.get('name', '')}」に残す"
+        if self.action == "record_value":
+            ref = self.element()
+            what = describe_element(ref) if ref else "(対象未指定)"
+            name = str(self.params.get("label", "")).strip() or "(項目名未指定)"
+            # 一覧が横に伸びるのでファイル名だけにする（フルパスは項目の下）
+            where = Path(str(self.params.get("file", "")).replace("\\", "/")).name
+            return f"{what} の数値を「{name}」として「{where}」に記録する"
         if self.action == "wait_seconds":
             return f"{self.params.get('seconds', 0)} 秒待つ"
         if self.action == "run_program":
