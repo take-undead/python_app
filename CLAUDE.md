@@ -47,6 +47,8 @@ tools/
   new_app.py             # 新しいアプリの雛形を生成する
   build.py               # アプリを実行ファイルにまとめる（成果物は build/ 配下）
   make_shortcut.py       # エクスプローラーから起動するショートカットを作る
+  make_manual_shots.py   # マニュアルに載せる画面写真を撮る
+  make_manual_pdf.py     # マニュアル（Markdown）を PDF にする
 build/                   # ビルド生成物（Git 管理外）
 common/                  # 複数アプリで使う共通コード（必要になってから作る）
 apps/
@@ -224,6 +226,36 @@ python tools/build.py webcam --onedir     # OpenCV を使うアプリはこち�
 - 既定はコンソールなし。**exe が起動しない場合のみ `--console` で作り直す。** モジュールの同梱漏れやパス崩れは Python 実行では再現せず exe 起動時にしか出ないため、そのときだけ例外を読む必要がある。
 - ビルド先の exe が実行中だと Windows が上書きを拒否する。`tools/build.py` が検出して PID を表示するので、ウィンドウを閉じてから再実行する。`--onefile` の exe は親子 2 プロセス構成のため、強制終了ではなくウィンドウの「×」で閉じること（親だけ落とすと子が残ってロックし続ける）。
 - **`Path(__file__)` 起点のデータパスは exe 化すると壊れる。** `--onefile` は一時フォルダへ自己展開するので、設定やログの保存先がそこになり終了時に消える。実行ファイル化するアプリは `getattr(sys, "frozen", False)` で分岐し、`sys.executable` 起点に切り替える。
+
+## マニュアル（配布用の PDF）
+
+使う人向けの操作マニュアルは、アプリ配下に `MANUAL.md` として置く。画面写真と PDF はそこから生成する。
+
+```powershell
+python tools/make_manual_shots.py win_rpa                       # apps/win_rpa/images/ に画面写真
+python tools/make_manual_pdf.py apps/win_rpa/MANUAL.md          # build/docs/ に PDF
+python tools/make_manual_pdf.py apps/win_rpa/MANUAL.md --open   # 作って開く
+python tools/make_manual_pdf.py apps/win_rpa/MANUAL.md --html-only
+```
+
+マニュアルは**全アプリぶんある**（`webcam` / `webpin` / `esp32cam` / `win_rpa`）。
+**アプリを 1 つ足したら、`tools/make_manual_shots.py` の `SHOOTERS` にその撮り方を足す**
+（アプリごとに、何を見せるべきかも見せてよいかも違うので、共通化しない）。
+
+- **原本は Markdown 1 本。** PDF は生成物なので `build/docs/` に出す（Git 管理外）。PDF を直接編集しない。
+- **画面写真も手で撮らない。** `tools/make_manual_shots.py` に撮る手順を書き、`apps/<アプリ名>/images/` へ出す。画面が変わるたびに撮り直すので、手で撮ると切り取る範囲も写す内容も毎回ぶれる。**画像は Git 管理対象**（マニュアルの一部のため）。
+- 写真に**この PC の実データを写さない。** 見本のデータをその場で作って画面に流し込む（win_rpa は `_demo_scenario()`、webpin は `_demo_samples()`）。実際のフォルダ名やシナリオ名が配布物に載るのを防ぐため。
+- **機材を実際に動かさない。** カメラを開くと開発機の部屋がそのまま載り、マイコンやカメラが手元に無いと撮れなくなる。見本のデータを画面に渡し、**ボタンの状態だけ動作中のものに合わせる**（webcam/esp32cam は `_show_frame()` に見本の絵、webpin は `SeriesStore` に見本の波形）。**見本と分かるよう、写真の説明文にそう書く。**
+- 説明文（`![...]` の中）は PDF で写真の下のキャプションになる。**何の写真かを 1 行で書く。**
+- **画面写真は座標で切り取らない。** `ImageGrab` に画面座標を渡す方法は、画面が複数あって左や上に並んでいると座標が負になってずれ、表示倍率でもずれる。`PrintWindow`（`PW_RENDERFULLCONTENT`）で窓自身に描かせる。他の窓が重なっていても写り込まない。
+- 小窓（`Toplevel`）は `transient` なので、**親を `withdraw()` すると一緒に消えて大きさが決まらない**（1x1 の画像になる）。親は出したままにする。
+- 別スレッドの結果を待つ画面（スケジュール一覧の `schtasks`）は、`update()` を回すだけでは時間が進まない。実時間で待つこと。
+- マニュアルに載せる画像は `![説明](images/xxx.png)` を**行に 1 つだけ**書く。文中には置けない。PDF には data URI で埋め込まれる（相対パスのままだと出力先の `build/docs/` から見て切れるため）。
+- PDF 化は **Microsoft Edge のヘッドレスモード**（`--print-to-pdf`）で行う。Windows に最初から入っているので `requirements.txt` を増やさない。
+- `tools/make_manual_pdf.py` が解釈するのは、こちらが書く記法だけ（見出し / 表 / 箇条書き / コードブロック / 引用 / `**太字**` / `` `コード` ``）。汎用の Markdown パーサではないので、凝った記法を足すならツール側にも足す。
+- `## 見出し` から**目次を自動生成**し、最初の見出しの前に差し込む。章番号は見出しに手で書く（相互参照「→ 8 章」がずれるので、章を増やしたら通しで確認する）。
+- **コードブロックは折り返さない**（`white-space: pre`）。A4 の本文幅に収まらない図はそこで切れるため、罫線で組んだ画面図は入れない。位置は本文と表で説明する。
+- `README.md`（開発者向け）と `MANUAL.md`（使う人向け）は別物。**設計の理由を MANUAL.md に書かない。**
 
 ## 変更後の確認
 

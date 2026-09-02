@@ -7,6 +7,17 @@ ESP32（TTGO T-Display）から WebSocket でピン情報を受け取り、
 python apps/webpin/main.py
 ```
 
+**使う人に渡すマニュアルは [MANUAL.md](MANUAL.md)。** 画面写真と PDF は次で作る。
+
+```powershell
+python tools/make_manual_shots.py webpin               # images/ に画面写真
+python tools/make_manual_pdf.py apps/webpin/MANUAL.md  # build/docs/ に PDF
+```
+
+画面を変えたら MANUAL.md も直し、写真を撮り直して PDF を作り直すこと。
+**撮影にマイコンは要らない**。見本の波形を `SeriesStore` に流し込んで撮っている
+（`tools/make_manual_shots.py` の `_demo_samples()`）。
+
 ## 接続先
 
 マイコン側は WiFi 接続後に `ws://<IP>/ws` で待ち受ける。
@@ -114,6 +125,8 @@ BOM 付き UTF-8（`utf-8-sig`）で書き出す。
 | `logic/recorder.py` | CSV への書き出し |
 | `ui/chart.py` | `tk.Canvas` に直接描く折れ線グラフ |
 | `ui/main_window.py` | 画面全体と受信の取り込み |
+| `MANUAL.md` | 使う人向けの操作マニュアル（PDF の原本） |
+| `images/` | マニュアルに載せる画面写真（`tools/make_manual_shots.py` が作る） |
 
 ## 依存
 

@@ -9,6 +9,19 @@ ESP32-CAM（AI-Thinker、`net_cam` ファームウェア）**6 台**に接続し
 python apps/esp32cam/main.py
 ```
 
+**使う人に渡すマニュアルは [MANUAL.md](MANUAL.md)。** 画面写真と PDF は次で作る。
+
+```powershell
+python tools/make_manual_shots.py esp32cam               # images/ に画面写真
+python tools/make_manual_pdf.py apps/esp32cam/MANUAL.md  # build/docs/ に PDF
+```
+
+画面を変えたら MANUAL.md も直し、写真を撮り直して PDF を作り直すこと。
+**撮影にカメラは要らない**。台ごとに色を変えた見本の映像を `_show_frame()` に渡し、
+ボタンの状態だけ接続中のものに合わせている（`tools/make_manual_shots.py` の
+`_demo_scene()`）。6 台そろっている保証が無く、つながってもその場の風景が
+そのまま載るため。
+
 ## 画面
 
 カメラ 6 台分のタイルを 3 列 × 2 行で並べる。各タイルに IP 入力欄と
@@ -80,6 +93,9 @@ logic/api.py           HTTP API クライアント（ポート 80）
 logic/stream.py        MJPEG 受信（ポート 81）
 logic/settings.py      6 台分の IP アドレスの保存・復元
 logic/paths.py         データの保存先（通常実行と exe で切り替える）
+
+MANUAL.md              使う人向けの操作マニュアル（PDF の原本）
+images/                マニュアルに載せる画面写真（tools/make_manual_shots.py が作る）
 ```
 
 台数は `logic/settings.py` の `CAMERA_COUNT`、列数は `ui/main_window.py` の

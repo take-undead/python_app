@@ -12,6 +12,18 @@ Windows アプリを自動操作して CSV を出力させ、複数の CSV を�
 作った経緯・設計判断の理由・現在地は [DEVLOG.md](DEVLOG.md) に分けてある。
 **作業を再開するときはそちらから読むこと。**
 
+**使う人に渡すマニュアルは [MANUAL.md](MANUAL.md)。** この README は開発者向けで、
+設計の理由まで書いてある。画面写真と配布用の PDF は次で作る。
+
+```powershell
+python tools/make_manual_shots.py win_rpa               # images/ に画面写真
+python tools/make_manual_pdf.py apps/win_rpa/MANUAL.md  # build/docs/ に PDF
+```
+
+画面の項目名や操作を変えたら、**MANUAL.md を直し、写真を撮り直して PDF を作り直すこと。**
+写真は手で撮らない（切り取る範囲と写す内容がぶれるため）。撮影中は画面に窓が出入りするので、
+そのあいだ PC を触らないこと。
+
 ## 実行
 
 ```powershell
@@ -418,6 +430,9 @@ ui/app_chooser.py      起動するアプリを選ぶ小窓
 ui/group_chooser.py    手順を移す先のグループを選ぶ小窓
 ui/about_dialog.py     用途と注意点を出す小窓（版表示をクリックで開く）
 ui/schedule_dialog.py  スケジュール登録の小窓
+
+MANUAL.md              使う人向けの操作マニュアル（PDF の原本）
+images/                マニュアルに載せる画面写真（tools/make_manual_shots.py が作る）
 
 scenarios/             シナリオ（JSON）
 work/                  対象アプリが出力した CSV と結合結果（Git 管理外）
